@@ -424,3 +424,70 @@ the `v4l2_live` kernel driver belong to live input. LG's decoders sit behind
 its own media stack, so hardware video in Firefox would need a decoder module
 for that stack, which is only reachable from a 32-bit build.
 
+---
+
+## 13. Native 32-bit Firefox: builds and runs on the TV
+
+Built 2026-09-22 with `build/sysroot-armel.sh`, `build/linux-build-arm32.sh`
+and `build/assemble-runtime-arm32.sh`, following the section 12 experiment.
+Compile time was about 25 minutes on 12 cores.
+
+**Toolchain.** clang 19 targeting `arm-linux-gnueabi` with
+`-march=armv7-a -mthumb -mfpu=neon -mfloat-abi=softfp`; Rust
+`armv7-unknown-linux-gnueabi` with `-soft-float,+vfp3,+neon`. The sysroot is
+Debian 11 armel (glibc 2.31) with GCC 11's C++ headers from Debian 12 and the
+TV's own `libstdc++.so.6.0.29` for linking.
+
+**Obstacles found and fixed, each as a patch or a build setting:**
+
+1. *Firefox chose a hard-float Rust target* (`thumbv7neon-...-gnueabihf`)
+   for any non-hard float ABI: with an empty suffix every target "ends with"
+   it. `build/patches/rust-target-softfp.patch` excludes hf targets unless the
+   ABI is hard and prefers the exact environment.
+2. *Debian 11's GCC 10 C++ headers are too old*: `std::lerp` with mixed float
+   and double arguments is ambiguous there. GCC 11 headers fix it and match
+   the TV's runtime exactly.
+3. *The TV's libstdc++ references glibc 2.32 to 2.35 symbols* the 2.31
+   sysroot lacks. Linking uses `--allow-shlib-undefined`, carried on `CC` and
+   `CXX` because configure's link tests ignore `LDFLAGS`. Firefox's own code
+   is still resolved against 2.31.
+4. *Debian sysroot symlinks were absolute* and pointed at the build
+   machine's `/lib`; `build/sysroot-relink.py` rewrites them.
+5. *libjpeg-turbo's NEON assembly* declared `.fpu neon` before
+   `.arch armv7a`; LLVM's assembler resets FPU extensions on `.arch`, giving
+   1,308 errors. `build/patches/libjpeg-neon-arch-order.patch` swaps them.
+6. *The TV's Mali driver needs `GLIBCXX_3.4.29`*, newer than Debian 11's, so
+   the runtime must not bundle libstdc++. It takes glibc, libstdc++,
+   libgcc_s, EGL, GLES, wayland-egl, wayland-server, gbm, drm, PulseAudio and
+   ALSA from the TV and bundles the rest (GTK stack, X11 libs, libffi.so.7).
+
+**Result.**
+
+| | 64-bit via bridge | 32-bit native |
+|---|---|---|
+| Runtime size | 324 MB | 253 MB |
+| `libxul.so` | 159 MB | 123 MB |
+| Package (`mach package`) | | 65.7 MB tar.xz |
+| Newest glibc symbol | 2.38 (bridge's 2.39) | 2.30 (TV has 2.35) |
+| Newest libstdc++ symbol | bundled | 3.4.29 (the TV's own) |
+| Memory, headless on the same Wikipedia page | 539 MB | **440 MB (-18%)** |
+
+`libxul` contains 117,000 hardware floating-point and 171,000 NEON
+instructions and no calls to software float helpers. Its ELF attributes say
+`Tag_CPU_arch: v5TE`, inherited from Debian's ARMv5 support objects; the code
+itself is ARMv7.
+
+On the TV, `firefox --version` prints `Mozilla Firefox 153.3.0esr`, every
+library resolves, and headless screenshots of example.com and a Wikipedia
+article render correctly. The adapter loads in its 32-bit form.
+
+**Still to test on screen:** GPU rendering through the Mali driver, which
+needs a window and so needs the TV free. Firefox may keep WebRender on its
+software path until its driver checks accept Mali on Wayland; if so,
+`gfx.webrender.all` is the lever. The TV also ships FFmpeg 5.0
+(`libavcodec.so.59`), which this Firefox can load for H.264 and AAC instead of
+the bundled FFmpeg the 64-bit build needed.
+
+**Not started:** hardware video decoding through LG's media stack, which
+needs a custom Firefox decoder module and handling for video shown on a
+separate display plane.

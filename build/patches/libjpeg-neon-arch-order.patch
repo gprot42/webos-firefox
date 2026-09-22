@@ -1,0 +1,15 @@
+diff --git a/media/libjpeg/simd/arm/aarch32/jsimd_neon.S b/media/libjpeg/simd/arm/aarch32/jsimd_neon.S
+index 7e1e2b1451..bbc6bf97b8 100644
+--- a/media/libjpeg/simd/arm/aarch32/jsimd_neon.S
++++ b/media/libjpeg/simd/arm/aarch32/jsimd_neon.S
+@@ -31,8 +31,9 @@
+ #endif
+ 
+ .text
+-.fpu neon
++/* LLVM resets FPU extensions on .arch, so .fpu must follow it. */
+ .arch armv7a
++.fpu neon
+ .object_arch armv4
+ .arm
+ .syntax unified

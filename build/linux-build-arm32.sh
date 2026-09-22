@@ -16,11 +16,15 @@ rustup target add armv7-unknown-linux-gnueabi >/dev/null
 
 phase "patch firefox build system"
 cd /work/firefox
-if git -c safe.directory=/work/firefox apply --check /src/build/patches/rust-target-softfp.patch 2>/dev/null; then
-    git -c safe.directory=/work/firefox apply /src/build/patches/rust-target-softfp.patch && echo applied
-else
-    echo "already applied"
-fi
+for patch in /src/build/patches/*.patch; do
+    if git -c safe.directory=/work/firefox apply --check "$patch" 2>/dev/null; then
+        git -c safe.directory=/work/firefox apply "$patch" && echo "applied $(basename "$patch")"
+    elif git -c safe.directory=/work/firefox apply --reverse --check "$patch" 2>/dev/null; then
+        echo "already applied $(basename "$patch")"
+    else
+        echo "PATCH DOES NOT APPLY: $(basename "$patch")"; exit 1
+    fi
+done
 
 phase "configure"
 ./mach configure
