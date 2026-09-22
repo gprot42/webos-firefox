@@ -1,0 +1,17 @@
+# ESR 153 for the OLED55C56LB: armv7 softfp, Wayland, no X11.
+# build/build-firefox.sh checks these flags against ./mach configure --help
+# on the pinned tag before trusting them.
+
+ac_add_options --enable-application=browser
+ac_add_options --target=arm-linux-gnueabi
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland
+ac_add_options --without-x
+ac_add_options --disable-updater
+ac_add_options --disable-crashreporter
+ac_add_options --disable-tests
+ac_add_options --disable-debug
+ac_add_options --enable-optimize
+ac_add_options --enable-release
+
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-webos
+mk_add_options AUTOCLOBBER=1
