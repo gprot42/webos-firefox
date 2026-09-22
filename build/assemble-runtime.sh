@@ -1,57 +1,71 @@
 #!/bin/bash
-# Turn a finished mach package into app/firefox-runtime and an IPK.
-# Run inside the ffbuild container, after ./mach package.
+# Turn the mach package into app/firefox-runtime, then pack the IPK.
+# Libraries the TV must supply itself (glibc, libstdc++, the Mali GPU stack,
+# PulseAudio, ALSA) are left out; everything else Firefox needs is bundled
+# from the Debian armel sysroot so the GTK stack stays self-consistent.
+# Run inside ffbuild:  podman exec ffbuild bash /src/build/assemble-runtime.sh
 set -euo pipefail
+SR=/work/sysroot-armel
+OBJ=/work/obj-arm32
+OUT=/src/app/firefox-runtime
+TAR=$(ls "$OBJ"/dist/firefox-*.tar.xz | head -1)
+# The TV's Mali driver needs GLIBCXX_3.4.29, newer than Debian 11's libstdc++,
+# so libstdc++ and libgcc_s must come from the TV, as must the GPU stack.
+TV_ONLY='^(ld-linux\.so\.3|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libresolv\.so\.2|libutil\.so\.1|libstdc\+\+\.so\.6|libgcc_s\.so\.1|libEGL\.so\.1|libGLESv2\.so\.2|libGLdispatch\.so\.0|libGLX\.so\.0|libGL\.so\.1|libOpenGL\.so\.0|libwayland-egl\.so\.1|libwayland-server\.so\.0|libgbm\.so\.1|libdrm\.so\.2|libpulse.*|libasound\.so\.2)$'
 
-SRC=/src
-WORK=/work
-RUNTIME=$SRC/app/firefox-runtime
-BRIDGE_LIB=/media/developer/apps/usr/palm/applications/org.webosbrew.bridge-64to32/lib
-INTERP=$BRIDGE_LIB/ld-linux-aarch64.so.1
-RPATH="\$ORIGIN:$BRIDGE_LIB"
-TARBALL=$(echo "$WORK"/obj-firefox/dist/firefox-*.linux-aarch64.tar.xz)
+echo "package: $TAR"
+# Always install the adapter fresh from its build tree. (Copying the old one
+# aside through mktemp once left it mode 0600: unreadable to the jailed app
+# user, so the loader silently fell back to the TV's libwayland-client.)
+ADAPTER=/tmp/wayland-1.22.0/build-arm32/src/libwayland-client.so.0.22.0
+[ -f "$ADAPTER" ] || { echo "build the adapter first: build/build-adapter.sh"; exit 1; }
+rm -rf "$OUT" /tmp/ff32 && mkdir -p "$OUT" /tmp/ff32
+tar -xJf "$TAR" -C /tmp/ff32 && cp -a /tmp/ff32/firefox/. "$OUT/"
+install -m 0755 "$ADAPTER" "$OUT/libwayland-client.so.0"
+mkdir -p "$OUT/defaults/pref" && cp /src/app/defaults/pref/00-webos.js "$OUT/defaults/pref/"
 
-echo "tarball $TARBALL"
-rm -rf "$RUNTIME" "$WORK/firefox-unpack"
-mkdir -p "$RUNTIME" "$WORK/firefox-unpack"
-tar -xJf "$TARBALL" -C "$WORK/firefox-unpack"
-cp -a "$WORK/firefox-unpack/firefox/." "$RUNTIME/"
+# Image decoders for GTK. Debian's gdk-pixbuf loads PNG, JPEG and the rest as
+# plug-ins listed in loaders.cache; without them GTK aborts on its first icon
+# ("Failed to load image-missing.png: Unrecognized image file format"). The
+# cache holds absolute paths on the TV; build/gdk-pixbuf-loaders.cache was
+# generated there with the bundled gdk-pixbuf-query-loaders.
+PB=$SR/usr/lib/arm-linux-gnueabi/gdk-pixbuf-2.0
+mkdir -p "$OUT/gdk-pixbuf/loaders"
+for l in png jpeg gif ico bmp xpm; do cp -L "$PB/2.10.0/loaders/libpixbufloader-$l.so" "$OUT/gdk-pixbuf/loaders/"; done
+cp -L "$PB/gdk-pixbuf-query-loaders" "$OUT/gdk-pixbuf/"
+[ -f /src/build/gdk-pixbuf-loaders.cache ] && cp /src/build/gdk-pixbuf-loaders.cache "$OUT/gdk-pixbuf/loaders.cache"
 
-copy_deps() {
-    local bin=$1
-    ldd "$bin" 2>/dev/null | awk '/=> \// {print $1, $3}' | while read -r soname lib; do
-        [[ -n $lib && -f $lib ]] || continue
-        case $soname in
-            libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|libresolv.so.2|libutil.so.1|ld-linux-aarch64.so.1)
-                continue
-                ;;
-        esac
-        cp -L "$lib" "$RUNTIME/$soname"
-    done
-}
-
-for _ in 1 2 3 4 5 6; do
-    while IFS= read -r bin; do
-        copy_deps "$bin"
-    done < <(find "$RUNTIME" -type f \( -name '*.so' -o -name 'firefox' -o -name 'firefox-bin' \))
+needed() { readelf -d "$1" 2>/dev/null | awk -F'[][]' '/NEEDED/{print $2}'; }
+for pass in 1 2 3 4 5 6; do
+    added=0
+    while IFS= read -r elf; do
+        for lib in $(needed "$elf"); do
+            [[ $lib =~ $TV_ONLY ]] && continue
+            [ -e "$OUT/$lib" ] && continue
+            src=$(ls "$SR"/lib/arm-linux-gnueabi/"$lib" "$SR"/usr/lib/arm-linux-gnueabi/"$lib" 2>/dev/null | head -1 || true)
+            if [ -z "$src" ]; then echo "  unresolved: $lib (needed by $(basename "$elf"))"; continue; fi
+            cp -L "$src" "$OUT/$lib"; added=$((added+1))
+        done
+    done < <(find "$OUT" -type f \( -name '*.so*' -o -name firefox -o -name firefox-bin \) -exec sh -c 'file -b "$1" | grep -q ELF && echo "$1"' _ {} \;)
+    echo "pass $pass: bundled $added"
+    [ "$added" -eq 0 ] && break
 done
+find "$OUT" -maxdepth 1 -name '*.so*' -newer "$TAR" -exec llvm-strip --strip-unneeded {} \; 2>/dev/null || true
 
-while IFS= read -r bin; do
-    file -b "$bin" | grep -q ELF || continue
-    patchelf --set-rpath "$RPATH" "$bin" || true
-    if patchelf --print-interpreter "$bin" >/dev/null 2>&1; then
-        patchelf --set-interpreter "$INTERP" "$bin"
-    fi
-done < <(find "$RUNTIME" -type f)
+# Do not patchelf these 32-bit binaries: setting RUNPATH with patchelf made
+# every one of them segfault on start. The launcher's library path is used.
 
-# Firefox scans defaults/pref and defaults/preferences. It never reads
-# distribution/preferences, which is only ever distribution.ini.
-mkdir -p "$RUNTIME/defaults/pref"
-cp "$SRC/app/defaults/pref/00-webos.js" "$RUNTIME/defaults/pref/"
-chmod 755 "$RUNTIME/firefox"
-echo "interpreter $(patchelf --print-interpreter "$RUNTIME/firefox")"
-echo "rpath $(patchelf --print-rpath "$RUNTIME/firefox")"
-ls -lh "$RUNTIME/firefox" "$RUNTIME/libxul.so" "$RUNTIME/libgtk-3.so.0"
-du -sh "$RUNTIME"
-python3 "$SRC/scripts/pack-ipk.py"
+# The app runs as an unprivileged jail user: everything must be world-readable.
+chmod -R a+rX "$OUT"
+echo "--- checks"
+unreadable=$(find "$OUT" -type f ! -perm -o=r | wc -l)
+echo "files not readable by the jail user: $unreadable"
+[ "$unreadable" -eq 0 ] || exit 1
+maxglibc=$(find "$OUT" -type f -exec sh -c 'file -b "$1" | grep -q ELF && objdump -T "$1" 2>/dev/null' _ {} \; | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+maxcxx=$(find "$OUT" -type f -exec sh -c 'file -b "$1" | grep -q ELF && objdump -T "$1" 2>/dev/null' _ {} \; | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -1)
+echo "newest glibc symbol needed: $maxglibc (TV has 2.35)"
+echo "newest libstdc++ symbol needed: $maxcxx (TV provides at least 3.4.29)"
+file "$OUT/firefox" | cut -d, -f1-3
+du -sh "$OUT"
+python3 /src/scripts/pack-ipk.py
 echo ASSEMBLE_DONE

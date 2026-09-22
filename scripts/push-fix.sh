@@ -42,10 +42,6 @@ $SCP "$ROOT/app/geckotv.sh" "root@$TV_IP:$APP/geckotv.sh.new"
 $SCP "$ROOT/app/appinfo.json" "root@$TV_IP:$APP/appinfo.json.new"
 $SCP "$ROOT/app/icon.png" "root@$TV_IP:$APP/icon.png.new"
 $SCP "$ROOT/app/largeIcon.png" "root@$TV_IP:$APP/largeIcon.png.new"
-# Minimal FFmpeg (H.264/AAC/MP3 decoders only), built by build/ffmpeg-mini.sh.
-for f in libavcodec.so.60 libavutil.so.58 libswresample.so.4; do
-    [ -f "$ROOT/app/firefox-runtime/$f" ] && $SCP "$ROOT/app/firefox-runtime/$f" "root@$TV_IP:$APP/firefox-runtime/$f"
-done
 $SCP "$ROOT/app/defaults/pref/00-webos.js" \
     "root@$TV_IP:$APP/firefox-runtime/defaults/pref/00-webos.js"
 $SSH "cd $APP && cp appinfo.json appinfo.json.bak-$TS \

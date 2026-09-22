@@ -182,8 +182,8 @@ in the launcher's `env` file.
 
 Firefox's bundled `libmozavcodec` carries only the royalty-free codecs, and
 there is no 64-bit system FFmpeg to load. `about:support` originally read
-`H264 NONE, AAC NONE, VP9 SWDEC, AV1 NONE`. `build/ffmpeg-mini.sh` builds a
-2.7 MB FFmpeg with just H.264, AAC and MP3 and drops it into the runtime;
+`H264 NONE, AAC NONE, VP9 SWDEC, AV1 NONE`. `build/ffmpeg-mini.sh` (since removed with the 64-bit build) built a
+2.7 MB FFmpeg with just H.264, AAC and MP3 and dropped it into the runtime;
 `about:support` now reads `H264 SWDEC | VP9 SWDEC | AAC SWDEC | MP3 SWDEC`.
 
 **Never set `media.mediasource.webm.enabled=false`.** Before FFmpeg was
@@ -233,6 +233,18 @@ then refusing to continue is the shape of a client-attestation check this build
 cannot satisfy. Nothing on our side is likely to change it.
 
 ---
+
+**Newer evidence (2026-09-22, 32-bit build, GPU rendering).** Hooks on
+`SourceBuffer`, `MediaSource`, `fetch` and the `<video>` element show the
+media side is healthy: 0-3 dropped frames, a 60 s buffer, no append
+exceptions and no `MediaError`. The SABR `videoplayback` POSTs keep returning
+HTTP 200 after about 50 s but carry no media: appends stop while the requests
+go on. The player plays out its buffer and raises `onError 5` with 14-20 s
+still buffered, then empties the element. YouTube's server is withholding
+video, the pattern for a client it scores as a bot. Every launch until then
+passed `--marionette`, which makes `navigator.webdriver` true on every page.
+The launcher now enables Marionette only when `<app dir>/marionette` exists.
+Whether that alone fixes playback is still to be confirmed.
 
 ## 9. GPU rendering through the 64-bit bridge: a dead end
 

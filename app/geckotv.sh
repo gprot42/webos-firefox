@@ -18,15 +18,9 @@ export MOZ_DISABLE_RDD_SANDBOX=1
 export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
 export MOZ_DISABLE_GPU_SANDBOX=1
 
-BRIDGE_LIB=/media/developer/apps/usr/palm/applications/org.webosbrew.bridge-64to32/lib
-LIBPATH="$BRIDGE_LIB"
-if [ -d "$APP_DIR/lib" ]; then
-    LIBPATH="$APP_DIR/lib:$LIBPATH"
-fi
 if [ -d "$APP_DIR/firefox-runtime" ]; then
-    LIBPATH="$APP_DIR/firefox-runtime:$LIBPATH"
+    export LD_LIBRARY_PATH="$APP_DIR/firefox-runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-export LD_LIBRARY_PATH="$LIBPATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 cd "$APP_DIR" || exit 1
 exec >>"$APP_DIR/geckotv.log" 2>&1

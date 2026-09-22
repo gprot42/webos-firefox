@@ -3,7 +3,6 @@
 
 # Built Firefox runtime and native binaries
 app/firefox-runtime/
-app/firefox-runtime-arm32/
 app/firefox
 app/lib/
 app/smoke
@@ -33,7 +32,7 @@ app/profile/
 app/*.log
 app/env
 app/wayland-debug
-app/gl-bridge
+app/marionette
 *.moz_log
 *.bak
 *.bak-*

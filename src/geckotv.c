@@ -8,7 +8,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* 32-bit entry point. webOS runs this ELF, then it execs the 64-bit browser. */
+/* Entry point. webOS runs this ELF, which sets up the environment and execs
+ * the native 32-bit Firefox in firefox-runtime. */
 
 static void mkdir_p(const char *path)
 {
@@ -54,22 +55,6 @@ static void give_profile(const char *path, uid_t uid, gid_t gid)
     closedir(dir);
 }
 
-/* EI_CLASS of an ELF file: 1 = 32-bit, 2 = 64-bit, 0 = unreadable. */
-static int elf_class(const char *path)
-{
-    unsigned char hdr[5] = {0};
-    int fd = open(path, O_RDONLY);
-
-    if (fd < 0)
-        return 0;
-    if (read(fd, hdr, sizeof hdr) != (ssize_t)sizeof hdr || hdr[0] != 0x7f || hdr[1] != 'E') {
-        close(fd);
-        return 0;
-    }
-    close(fd);
-    return hdr[4];
-}
-
 int main(int argc, char **argv)
 {
     char exe[PATH_MAX];
@@ -79,7 +64,6 @@ int main(int argc, char **argv)
     char libpath[PATH_MAX * 2];
     char logpath[PATH_MAX];
     char marker[PATH_MAX];
-    const char *bridge = "/media/developer/apps/usr/palm/applications/org.webosbrew.bridge-64to32/lib";
     char *args[12];
     int fd;
     int narg = 0;
@@ -131,16 +115,10 @@ int main(int argc, char **argv)
     snprintf(libpath, sizeof libpath, "%s/parent.lock", home);
     unlink(libpath);
     snprintf(firefox, sizeof firefox, "%s/firefox-runtime/firefox", dir);
-    /* Runtime copy of libwayland-client carries the webOS shell adapter.
-     * A 64-bit Firefox needs the 64-bit bridge's loader and glibc; a native
-     * 32-bit build runs on the TV's own libraries, and must not see the
-     * bridge's 64-bit ones on its search path. */
-    if (elf_class(firefox) == 2)
-        snprintf(libpath, sizeof libpath, "%s/firefox-runtime:%s", dir, bridge);
-    else
-        snprintf(libpath, sizeof libpath, "%s/firefox-runtime", dir);
-    fprintf(stderr, "geckotv firefox is %s-bit\n", elf_class(firefox) == 2 ? "64" : "32");
-    /* The 32-bit runtime's GTK finds its image decoders through this cache. */
+    /* The runtime's own libraries come first; its copy of libwayland-client
+     * carries the webOS shell adapter. Everything else is the TV's. */
+    snprintf(libpath, sizeof libpath, "%s/firefox-runtime", dir);
+    /* The runtime's GTK finds its image decoders through this cache. */
     snprintf(marker, sizeof marker, "%s/firefox-runtime/gdk-pixbuf/loaders.cache", dir);
     if (access(marker, R_OK) == 0)
         setenv("GDK_PIXBUF_MODULE_FILE", marker, 1);
@@ -161,16 +139,6 @@ int main(int argc, char **argv)
     setenv("MOZ_DISABLE_GPU_SANDBOX", "1", 1);
     setenv("LD_LIBRARY_PATH", libpath, 1);
     unsetenv("LD_PRELOAD");
-    /* GPU rendering through org.webosbrew.bridge-64to32. Its libEGL.so.1
-     * references GLES symbols without declaring libGLESv2 as a dependency,
-     * so Firefox's dlopen of libEGL fails unless GLES is already global.
-     * Opt-in while it is being evaluated: touch <app dir>/gl-bridge. */
-    snprintf(marker, sizeof marker, "%s/gl-bridge", dir);
-    if (access(marker, F_OK) == 0) {
-        snprintf(marker, sizeof marker, "%s/libGLESv2.so.2", bridge);
-        setenv("LD_PRELOAD", marker, 1);
-        fprintf(stderr, "geckotv gl-bridge: LD_PRELOAD=%s\n", marker);
-    }
     /* Wire-level trace: touch <app dir>/wayland-debug, launch once, then
      * delete the file. libwayland prints every message to stderr, which
      * is geckotv.log. */
@@ -208,10 +176,17 @@ int main(int argc, char **argv)
     args[narg++] = "--profile";
     args[narg++] = home;
     args[narg++] = "--no-remote";
-    args[narg++] = "--marionette";
-    /* Lets a Marionette client switch to chrome context, which is how
-     * prefs are read and set on the live browser from the Mac. */
-    args[narg++] = "-remote-allow-system-access";
+    /* Remote control for debugging from the Mac: touch <app dir>/marionette.
+     * Off by default because it sets navigator.webdriver on every page, and
+     * YouTube then stops sending video after about a minute. */
+    snprintf(marker, sizeof marker, "%s/marionette", dir);
+    if (access(marker, F_OK) == 0) {
+        args[narg++] = "--marionette";
+        /* Lets a Marionette client switch to chrome context, which is how
+         * prefs are read and set on the live browser from the Mac. */
+        args[narg++] = "-remote-allow-system-access";
+        fprintf(stderr, "geckotv marionette on because %s exists\n", marker);
+    }
     if (argc > 1 && argv[1][0] != '{') {
         int i;
         for (i = 1; i < argc && narg < 10; i++)

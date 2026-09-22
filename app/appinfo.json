@@ -5,7 +5,7 @@
   "type": "native",
   "main": "geckotv",
   "title": "Firefox",
-  "appDescription": "Firefox ESR 153 for webOS TV, aarch64 via the 64-bit bridge.",
+  "appDescription": "Firefox ESR 153 for webOS TV, native 32-bit with GPU rendering.",
   "icon": "icon.png",
   "largeIcon": "largeIcon.png",
   "iconColor": "#12343b",

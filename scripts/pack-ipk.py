@@ -18,7 +18,7 @@ DIST = ROOT / "dist"
 SKIP_DIRS = {"profile"}
 SKIP_SUFFIXES = {".log"}
 # Marker files and backups that must never ship.
-SKIP_NAMES = {".DS_Store", "wayland-debug", "env", "gl-bridge"}
+SKIP_NAMES = {".DS_Store", "wayland-debug", "env", "marionette"}
 
 
 def ar_header(name: str, size: int) -> bytes:

@@ -1,5 +1,7 @@
 #!/bin/bash
-# Rebuild libwayland-client with the webOS shell adapter baked in.
+# Rebuild libwayland-client with the webOS shell adapter baked in, for the
+# native 32-bit Firefox. Run inside ffbuild:
+#   podman exec ffbuild bash /src/build/build-adapter.sh
 set -euo pipefail
 ROOT=/src
 WL=/tmp/wayland-1.22.0
@@ -220,10 +222,13 @@ mb.write_text(m)
 print("patched")
 PY
 cd "$WL"
-if [[ ! -f build/build.ninja ]]; then
-    meson setup build -Ddocumentation=false -Ddtd_validation=false -Dtests=false
+# 32-bit ARMv7 softfp, against the Debian armel sysroot (build/arm32-cross.ini).
+if [[ ! -f build-arm32/build.ninja ]]; then
+    meson setup build-arm32 --cross-file "$ROOT/build/arm32-cross.ini" \
+        -Ddocumentation=false -Ddtd_validation=false -Dtests=false -Dscanner=false
 fi
-ninja -C build src/libwayland-client.so.0.22.0
-cp -L build/src/libwayland-client.so.0.22.0 "$ROOT/app/firefox-runtime/libwayland-client.so.0"
+ninja -C build-arm32 src/libwayland-client.so.0.22.0
+mkdir -p "$ROOT/app/firefox-runtime"
+install -m 0755 build-arm32/src/libwayland-client.so.0.22.0 "$ROOT/app/firefox-runtime/libwayland-client.so.0"
 echo ADAPTER_OK
 file "$ROOT/app/firefox-runtime/libwayland-client.so.0"
