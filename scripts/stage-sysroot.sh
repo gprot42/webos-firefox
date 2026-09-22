@@ -28,13 +28,13 @@ copy_one() {
 }
 
 for name in ld-linux.so.3 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 \
-    librt.so.1 libresolv.so.2 libutil.so.1 libz.so.1 libz.so.1.2.11; do
+    librt.so.1 libresolv.so.2 libutil.so.1 libz.so.1 libz.so.1.2.11 libgcc_s.so.1; do
     copy_one "$ROOTFS/lib/$name" "$OUT/lib"
 done
 
 for pattern in libwayland-client.so libwayland-egl.so libwayland-cursor.so \
     libwayland-webos-client.so libpulse.so libasound.so libffi.so \
-    libexpat.so libxkbcommon.so; do
+    libexpat.so libxkbcommon.so libstdc++.so; do
     found=0
     for src in "$ROOTFS/usr/lib/$pattern"*; do
         if [ -e "$src" ]; then

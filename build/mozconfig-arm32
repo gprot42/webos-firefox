@@ -1,0 +1,45 @@
+# Firefox ESR 153 as a native 32-bit program for the webOS TV userspace:
+# ARMv7, NEON, softfp calling convention. Uses the Debian 11 armel sysroot
+# (glibc 2.31 <= the TV's 2.35) built by build/sysroot-armel.sh.
+# Rust: stock armv7-unknown-linux-gnueabi with the FPU features switched on
+# (see findings.md section 12), so Rust code runs at hardware float speed.
+ac_add_options --enable-application=browser
+ac_add_options --target=arm-linux-gnueabi
+ac_add_options --with-arch=armv7-a
+ac_add_options --with-fpu=neon
+ac_add_options --with-float-abi=softfp
+ac_add_options --with-thumb=yes
+ac_add_options --with-sysroot=/work/sysroot-armel
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland-only
+ac_add_options --with-libclang-path=/usr/lib/llvm-19/lib
+ac_add_options --with-clang-path=/usr/bin/clang-19
+ac_add_options --without-wasm-sandboxed-libraries
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+ac_add_options --disable-tests
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --enable-optimize
+ac_add_options --enable-release
+ac_add_options --disable-webrtc
+ac_add_options --disable-accessibility
+ac_add_options --disable-printing
+ac_add_options --disable-parental-controls
+ac_add_options --disable-webspeech
+ac_add_options --disable-synth-speechd
+ac_add_options --disable-profiling
+ac_add_options --disable-geckodriver
+ac_add_options --enable-strip
+ac_add_options --enable-install-strip
+# --allow-shlib-undefined rides on the compiler command because configure's
+# own link tests ignore LDFLAGS (see the note below); -Qunused-arguments keeps
+# compile-only steps from warning about the linker flag.
+export CC="clang-19 -Qunused-arguments -Wl,--allow-shlib-undefined"
+export CXX="clang++-19 -Qunused-arguments -Wl,--allow-shlib-undefined"
+export RUSTFLAGS="-C target-feature=-soft-float,+vfp3,+neon"
+# The sysroot links against the TV's own libstdc++ (GCC 11), which was built
+# against the TV's glibc 2.35 and references GLIBC_2.32..2.35 symbols the
+# 2.31 sysroot lacks. The TV provides them at run time, so let the linker
+# accept undefined symbols inside shared libraries; Firefox's own objects are
+# still checked against glibc 2.31. (Set on CC/CXX above.)
+mk_add_options MOZ_OBJDIR=/work/obj-arm32

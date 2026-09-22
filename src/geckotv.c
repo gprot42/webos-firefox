@@ -54,6 +54,22 @@ static void give_profile(const char *path, uid_t uid, gid_t gid)
     closedir(dir);
 }
 
+/* EI_CLASS of an ELF file: 1 = 32-bit, 2 = 64-bit, 0 = unreadable. */
+static int elf_class(const char *path)
+{
+    unsigned char hdr[5] = {0};
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0)
+        return 0;
+    if (read(fd, hdr, sizeof hdr) != (ssize_t)sizeof hdr || hdr[0] != 0x7f || hdr[1] != 'E') {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+    return hdr[4];
+}
+
 int main(int argc, char **argv)
 {
     char exe[PATH_MAX];
@@ -115,8 +131,15 @@ int main(int argc, char **argv)
     snprintf(libpath, sizeof libpath, "%s/parent.lock", home);
     unlink(libpath);
     snprintf(firefox, sizeof firefox, "%s/firefox-runtime/firefox", dir);
-    /* Runtime copy of libwayland-client carries the webOS shell adapter. */
-    snprintf(libpath, sizeof libpath, "%s/firefox-runtime:%s", dir, bridge);
+    /* Runtime copy of libwayland-client carries the webOS shell adapter.
+     * A 64-bit Firefox needs the 64-bit bridge's loader and glibc; a native
+     * 32-bit build runs on the TV's own libraries, and must not see the
+     * bridge's 64-bit ones on its search path. */
+    if (elf_class(firefox) == 2)
+        snprintf(libpath, sizeof libpath, "%s/firefox-runtime:%s", dir, bridge);
+    else
+        snprintf(libpath, sizeof libpath, "%s/firefox-runtime", dir);
+    fprintf(stderr, "geckotv firefox is %s-bit\n", elf_class(firefox) == 2 ? "64" : "32");
 
     setenv("HOME", home, 1);
     setenv("XDG_CONFIG_HOME", home, 0);

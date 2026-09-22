@@ -1,0 +1,29 @@
+diff --git a/build/moz.configure/rust.configure b/build/moz.configure/rust.configure
+index a89585f6f8..785c6e50f0 100644
+--- a/build/moz.configure/rust.configure
++++ b/build/moz.configure/rust.configure
+@@ -366,11 +366,20 @@ def detect_rustc_target(
+                 suffix = "hf"
+             else:
+                 suffix = ""
++            # With an empty suffix every target "ends with" it, so hard-float
++            # targets used to win for soft/softfp builds. Their calling
++            # convention cannot call soft-float code, so exclude them, and
++            # prefer the exact environment (gnueabi over musleabi).
++            ordered = sorted(
++                candidates, key=lambda c: c.target.raw_os != host_or_target.raw_os
++            )
+             for p in prefixes:
+-                for c in candidates:
+-                    if c.rust_target.startswith(
+-                        "{}-".format(p)
+-                    ) and c.rust_target.endswith(suffix):
++                for c in ordered:
++                    if (
++                        c.rust_target.startswith("{}-".format(p))
++                        and c.rust_target.endswith(suffix)
++                        and (suffix == "hf" or not c.rust_target.endswith("hf"))
++                    ):
+                         return c.rust_target
+ 
+         # See if we can narrow down on the exact alias.
