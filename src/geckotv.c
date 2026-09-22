@@ -140,6 +140,10 @@ int main(int argc, char **argv)
     else
         snprintf(libpath, sizeof libpath, "%s/firefox-runtime", dir);
     fprintf(stderr, "geckotv firefox is %s-bit\n", elf_class(firefox) == 2 ? "64" : "32");
+    /* The 32-bit runtime's GTK finds its image decoders through this cache. */
+    snprintf(marker, sizeof marker, "%s/firefox-runtime/gdk-pixbuf/loaders.cache", dir);
+    if (access(marker, R_OK) == 0)
+        setenv("GDK_PIXBUF_MODULE_FILE", marker, 1);
 
     setenv("HOME", home, 1);
     setenv("XDG_CONFIG_HOME", home, 0);

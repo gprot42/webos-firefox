@@ -1,0 +1,28 @@
+diff --git a/toolkit/xre/glxtest/glxtest.cpp b/toolkit/xre/glxtest/glxtest.cpp
+index e19f5d7a39..a77e2f02bf 100644
+--- a/toolkit/xre/glxtest/glxtest.cpp
++++ b/toolkit/xre/glxtest/glxtest.cpp
+@@ -515,8 +515,10 @@ static bool get_egl_gl_status(EGLDisplay dpy,
+ 
+   log("GLX_TEST: get_egl_gl_status start\n");
+ 
++  // EGL_EXT_device_query only supplies the DRM device node, so treat it as
++  // optional: drivers such as Mali on webOS TVs lack it but render fine.
+   if (!eglChooseConfig || !eglCreateContext || !eglDestroyContext ||
+-      !eglMakeCurrent || !eglQueryDeviceStringEXT) {
++      !eglMakeCurrent) {
+     record_warning("libEGL missing methods for GL test");
+     return false;
+   }
+@@ -616,8 +618,9 @@ static bool get_egl_gl_status(EGLDisplay dpy,
+   }
+ 
+   EGLDeviceEXT device;
+-  if (eglQueryDisplayAttribEXT(dpy, EGL_DEVICE_EXT, (EGLAttrib*)&device) ==
+-      EGL_TRUE) {
++  if (eglQueryDisplayAttribEXT && eglQueryDeviceStringEXT &&
++      eglQueryDisplayAttribEXT(dpy, EGL_DEVICE_EXT, (EGLAttrib*)&device) ==
++          EGL_TRUE) {
+     const char* deviceExtensions =
+         eglQueryDeviceStringEXT(device, EGL_EXTENSIONS);
+     if (deviceExtensions &&

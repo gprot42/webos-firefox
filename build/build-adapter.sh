@@ -119,6 +119,84 @@ if "webos_xdg_create_virtual" not in text:
     if at < 0:
         raise SystemExit("virtual ctor site not found")
     text = text[:at] + fn + text[at:]
+if "webos_xdg_wrapper_destroy_report" not in text:
+    # Recover from wl_proxy_destroy() on a wrapper instead of aborting, and
+    # report the caller. Both paths into this check hold the display mutex,
+    # so do wl_proxy_wrapper_destroy()'s cleanup inline.
+    old = ('\tif (proxy->flags & WL_PROXY_FLAG_WRAPPER)\n'
+           '\t\twl_abort("Tried to destroy wrapper with wl_proxy_destroy()\\n");\n')
+    new = ('\tif (proxy->flags & WL_PROXY_FLAG_WRAPPER) {\n'
+           '\t\twebos_xdg_wrapper_destroy_report(proxy, webos_outer_caller);\n'
+           '\t\twl_list_remove(&proxy->queue_link);\n'
+           '\t\tfree(proxy);\n'
+           '\t\treturn;\n'
+           '\t}\n')
+    if old not in text:
+        raise SystemExit("wrapper abort site not found")
+    text = text.replace(old, new, 1)
+    decl = ("extern void webos_xdg_wrapper_destroy_report(struct wl_proxy *proxy, void *caller);\n"
+            "static __thread void *webos_outer_caller;\n")
+    marker = '#include "wayland-private.h"\n'
+    text = text.replace(marker, marker + decl, 1)
+    for sig in ("WL_EXPORT void\nwl_proxy_destroy(struct wl_proxy *proxy)\n{\n",):
+        if sig not in text:
+            raise SystemExit("wl_proxy_destroy not found")
+        text = text.replace(sig, sig + "\twebos_outer_caller = __builtin_return_address(0);\n", 1)
+    i = text.index("wl_proxy_marshal_flags(struct wl_proxy *proxy")
+    j = text.index("{\n", i) + 2
+    text = text[:j] + "\twebos_outer_caller = __builtin_return_address(0);\n" + text[j:]
+if "webos_xdg_last_caller" not in text:
+    # Let the adapter name the library that added a listener.
+    sig = ("wl_proxy_add_listener(struct wl_proxy *proxy,\n"
+           "\t\t      void (**implementation)(void), void *data)\n{\n")
+    if sig not in text:
+        raise SystemExit("wl_proxy_add_listener not found")
+    text = text.replace(sig, sig + "\twebos_outer_caller = __builtin_return_address(0);\n", 1)
+    decl = "static __thread void *webos_outer_caller;\n"
+    text = text.replace(decl, decl + "void *webos_xdg_last_caller(void);\n", 1)
+    text += "\nvoid *\nwebos_xdg_last_caller(void)\n{\n\treturn webos_outer_caller;\n}\n"
+if "webos_xdg_virtual_destroyed" not in text:
+    # Virtual proxies have id 0. Older generated code (wayland-scanner
+    # before 1.20, as in Debian 11's GTK) calls wl_proxy_destroy() after the
+    # destroy request, so hand those to the adapter instead of the id map.
+    sig = "WL_EXPORT void\nwl_proxy_destroy(struct wl_proxy *proxy)\n{\n"
+    at = text.find(sig)
+    if at < 0:
+        raise SystemExit("wl_proxy_destroy not found")
+    at = text.index("\n", text.index("webos_outer_caller = ", at)) + 1
+    text = (text[:at] +
+            "\tif (proxy->object.id == 0 && !(proxy->flags & WL_PROXY_FLAG_WRAPPER)) {\n"
+            "\t\twebos_xdg_virtual_destroyed(proxy);\n"
+            "\t\treturn;\n"
+            "\t}\n" + text[at:])
+    decl = "static __thread void *webos_outer_caller;\n"
+    text = text.replace(decl, decl + "void webos_xdg_virtual_destroyed(struct wl_proxy *proxy);\n", 1)
+if "webos_xdg_proxy_display" not in text:
+    # Let the adapter tell GDK's own display and registry apart from the
+    # wrappers and private queues that libraries such as Mali's EGL create.
+    decl = "static __thread void *webos_outer_caller;\n"
+    text = text.replace(decl, decl +
+        "struct wl_display *webos_xdg_proxy_display(struct wl_proxy *proxy);\n"
+        "int webos_xdg_on_default_queue(struct wl_proxy *proxy);\n", 1)
+    text += ("\nstruct wl_display *\nwebos_xdg_proxy_display(struct wl_proxy *proxy)\n{\n"
+             "\treturn proxy->display;\n}\n"
+             "\nint\nwebos_xdg_on_default_queue(struct wl_proxy *proxy)\n{\n"
+             "\treturn proxy->queue == &proxy->display->default_queue;\n}\n")
+if "webos_xdg_null_queue_report" not in text:
+    # A proxy whose queue was destroyed has queue == NULL; wrapping it
+    # would crash. Report it and fall back to the default queue.
+    old = "\twrapper->queue = wrapped_proxy->queue;\n"
+    if old not in text:
+        raise SystemExit("wrapper queue copy not found")
+    text = text.replace(old,
+        "\twrapper->queue = wrapped_proxy->queue;\n"
+        "\tif (!wrapper->queue) {\n"
+        "\t\twebos_xdg_null_queue_report(wrapped_proxy, __builtin_return_address(0));\n"
+        "\t\twrapper->queue = &wrapped_proxy->display->default_queue;\n"
+        "\t}\n", 1)
+    decl = "static __thread void *webos_outer_caller;\n"
+    text = text.replace(decl, decl +
+        "void webos_xdg_null_queue_report(struct wl_proxy *proxy, void *caller);\n", 1)
 p.write_text(text)
 mb = Path("/tmp/wayland-1.22.0/src/meson.build")
 m = mb.read_text()

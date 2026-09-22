@@ -1,0 +1,44 @@
+# GdkPixbuf Image Loader Modules file
+# Automatically generated file, do not edit
+# Created by gdk-pixbuf-query-loaders from gdk-pixbuf-2.42.2
+#
+# LoaderDir = /media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gdk-pixbuf/loaders
+#
+"/media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gdk-pixbuf/loaders/libpixbufloader-bmp.so"
+"bmp" 5 "gdk-pixbuf" "BMP" "LGPL"
+"image/bmp" "image/x-bmp" "image/x-MS-bmp" ""
+"bmp" ""
+"BM" "" 100
+
+"/media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gdk-pixbuf/loaders/libpixbufloader-gif.so"
+"gif" 4 "gdk-pixbuf" "GIF" "LGPL"
+"image/gif" ""
+"gif" ""
+"GIF8" "" 100
+
+"/media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gdk-pixbuf/loaders/libpixbufloader-ico.so"
+"ico" 5 "gdk-pixbuf" "Windows icon" "LGPL"
+"image/x-icon" "image/x-ico" "image/x-win-bitmap" "image/vnd.microsoft.icon" "application/ico" "image/ico" "image/icon" "text/ico" ""
+"ico" "cur" ""
+"  \001   " "zz znz" 100
+"  \002   " "zz znz" 100
+
+"/media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gdk-pixbuf/loaders/libpixbufloader-jpeg.so"
+"jpeg" 5 "gdk-pixbuf" "JPEG" "LGPL"
+"image/jpeg" ""
+"jpeg" "jpe" "jpg" ""
+"\377\330" "" 100
+
+"/media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gdk-pixbuf/loaders/libpixbufloader-png.so"
+"png" 5 "gdk-pixbuf" "PNG" "LGPL"
+"image/png" ""
+"png" ""
+"\211PNG\r\n\032\n" "" 100
+
+"/media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gdk-pixbuf/loaders/libpixbufloader-xpm.so"
+"xpm" 4 "gdk-pixbuf" "XPM" "LGPL"
+"image/x-xpixmap" ""
+"xpm" ""
+"/* XPM */" "" 100
+
+

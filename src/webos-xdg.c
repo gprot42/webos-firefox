@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 
-#include <execinfo.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -12,7 +11,10 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-util.h>
@@ -33,6 +35,10 @@ extern struct wl_proxy *webos_xdg_create_virtual(struct wl_proxy *factory,
                                                   const struct wl_interface *interface,
                                                   uint32_t version);
 extern void webos_xdg_destroy_virtual(struct wl_proxy *proxy);
+void webos_xdg_virtual_destroyed(struct wl_proxy *proxy);
+void webos_xdg_null_queue_report(struct wl_proxy *proxy, void *caller);
+struct wl_display *webos_xdg_proxy_display(struct wl_proxy *proxy);
+int webos_xdg_on_default_queue(struct wl_proxy *proxy);
 
 struct peek {
     const struct wl_interface *interface;
@@ -192,6 +198,7 @@ static void read_window_size(void)
 }
 static volatile int mapped_one;
 
+__attribute__((format(printf, 1, 2)))
 static void log_msg(const char *fmt, ...)
 {
     va_list ap;
@@ -210,16 +217,147 @@ static void log_msg(const char *fmt, ...)
     fflush(stderr);
 }
 
+/* Executable mappings, read once in the crash handler without stdio or
+ * malloc (the fault may be inside malloc). */
+static char crash_maps[192 * 1024];
+static struct { unsigned long lo, hi, pgoff; const char *name; } crash_exec[512];
+static int crash_nexec;
+static unsigned long crash_stack_hi;
+
+static void crash_load_maps(unsigned long sp)
+{
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    size_t len = 0;
+    ssize_t r;
+    char *p, *end;
+
+    if (fd < 0)
+        return;
+    while (len < sizeof crash_maps - 1 &&
+           (r = read(fd, crash_maps + len, sizeof crash_maps - 1 - len)) > 0)
+        len += r;
+    close(fd);
+    crash_maps[len] = '\0';
+    for (p = crash_maps; *p && crash_nexec < 512; p = end + 1) {
+        unsigned long lo, hi, pgoff;
+        char *q, *slash;
+
+        end = strchr(p, '\n');
+        if (!end)
+            break;
+        *end = '\0';
+        lo = strtoul(p, &q, 16);
+        hi = strtoul(q + 1, &q, 16);
+        if (sp >= lo && sp < hi)
+            crash_stack_hi = hi;
+        if (q[3] != 'x')                       /* " r-xp" */
+            continue;
+        pgoff = strtoul(q + 6, &q, 16);
+        slash = strrchr(q, '/');
+        crash_exec[crash_nexec].lo = lo;
+        crash_exec[crash_nexec].hi = hi;
+        crash_exec[crash_nexec].pgoff = pgoff;
+        crash_exec[crash_nexec].name = slash ? slash + 1 : "[anon]";
+        crash_nexec++;
+    }
+}
+
+static int crash_in_code(unsigned long a)
+{
+    int i;
+
+    for (i = 0; i < crash_nexec; i++)
+        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
+            return 1;
+    return 0;
+}
+
+static int crash_in_libc(unsigned long a)
+{
+    int i;
+
+    for (i = 0; i < crash_nexec; i++)
+        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
+            return !strcmp(crash_exec[i].name, "libc.so.6");
+    return 0;
+}
+
+/* Prints "what 0x... lib+0xoff"; returns 1 if the address is in code. */
+static int crash_resolve(const char *what, unsigned long a)
+{
+    int i;
+
+    for (i = 0; i < crash_nexec; i++)
+        if (a >= crash_exec[i].lo && a < crash_exec[i].hi) {
+            dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx %s+%#lx\n", what, a,
+                    crash_exec[i].name, a - crash_exec[i].lo + crash_exec[i].pgoff);
+            return 1;
+        }
+    dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx\n", what, a);
+    return 0;
+}
+
+/* From experiments/printf-trace when it is preloaded; NULL otherwise. */
+struct printf_trace {
+    void *caller;
+    const char *fmt;
+    const char *fn;
+};
+extern struct printf_trace *webos_printf_trace_get(void) __attribute__((weak));
+
 static void on_crash(int sig, siginfo_t *info, void *ctx)
 {
-    void *frames[48];
-    int n;
+    ucontext_t *uc = ctx;
+    unsigned long pc = 0, lr = 0, sp = 0;
+    int i, found = 0;
+    struct printf_trace last = { 0 };
 
-    (void)ctx;
-    dprintf(STDERR_FILENO, "\nwebos-xdg: signal %d addr=%p\n", sig,
-            info ? info->si_addr : NULL);
-    n = backtrace(frames, 48);
-    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    /* Copy before our own dprintf calls overwrite it. */
+    if (webos_printf_trace_get)
+        last = *webos_printf_trace_get();
+
+    dprintf(STDERR_FILENO, "\nwebos-xdg: signal %d addr=%p thread %ld\n", sig,
+            info ? info->si_addr : NULL, (long)syscall(SYS_gettid));
+#if defined(__arm__)
+    pc = uc->uc_mcontext.arm_pc;
+    lr = uc->uc_mcontext.arm_lr;
+    sp = uc->uc_mcontext.arm_sp;
+#elif defined(__aarch64__)
+    pc = uc->uc_mcontext.pc;
+    lr = uc->uc_mcontext.regs[30];
+    sp = uc->uc_mcontext.sp;
+#endif
+    crash_load_maps(sp);
+    crash_resolve("pc", pc);
+    crash_resolve("lr", lr);
+    if (webos_printf_trace_get) {
+        struct printf_trace *t = &last;
+        char fmt[160] = "";
+        struct iovec local = { fmt, sizeof fmt - 1 };
+        struct iovec remote = { (void *)t->fmt, sizeof fmt - 1 };
+
+        /* The format may sit at the end of a mapping: fall back to less. */
+        while (t->fmt && local.iov_len > 8 &&
+               process_vm_readv(getpid(), &local, 1, &remote, 1, 0) < 0)
+            local.iov_len = remote.iov_len = local.iov_len / 2;
+        fmt[local.iov_len] = '\0';
+        for (i = 0; fmt[i]; i++)
+            if (fmt[i] == '\n')
+                fmt[i] = '|';
+        dprintf(STDERR_FILENO, "webos-xdg:   last %s format \"%s\"\n", t->fn ? t->fn : "?", fmt);
+        crash_resolve("called from", (unsigned long)t->caller);
+    }
+    /* No unwind tables to trust here, so list stack words that point into
+     * code outside libc: the real return addresses are among them, in call
+     * order, mixed with stale values. */
+    for (i = 0; sp && i < 16384 && found < 32; i++) {
+        unsigned long *w = (unsigned long *)sp + i;
+
+        if ((unsigned long)(w + 1) > crash_stack_hi)
+            break;
+        if (crash_in_code(*w) && !crash_in_libc(*w))
+            found += crash_resolve("stack", *w);
+    }
     _exit(128 + sig);
 }
 
@@ -577,7 +715,23 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
             (void *)xdg_surface->webos_surface, fullscreen);
 }
 
-static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode,
+/* Undo what the adapter created for a virtual object and free its slot. */
+static void virt_teardown(struct virt *v)
+{
+    if (v->subsurface) {
+        if (synth_focus == (struct wl_surface *)v->wl_surface)
+            synth_focus = NULL;
+        wl_subsurface_destroy(v->subsurface);
+        v->subsurface = NULL;
+    }
+    if (v->shell_surface) {
+        wl_shell_surface_destroy(v->shell_surface);
+        v->shell_surface = NULL;
+    }
+    v->proxy = NULL;
+}
+
+static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t flags,
                                      const struct wl_interface *interface,
                                      union wl_argument *args)
 {
@@ -688,20 +842,27 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode,
         emit_toplevel_configure(v);
     if (opcode == 0 && v->proxy) {
         struct wl_proxy *dying = v->proxy;
-        if (v->subsurface) {
-            if (synth_focus == (struct wl_surface *)v->wl_surface)
-                synth_focus = NULL;
-            wl_subsurface_destroy(v->subsurface);
-            v->subsurface = NULL;
-        }
-        if (v->shell_surface) {
-            wl_shell_surface_destroy(v->shell_surface);
-            v->shell_surface = NULL;
-        }
-        v->proxy = NULL;
-        webos_xdg_destroy_virtual(dying);
+
+        virt_teardown(v);
+        /* Code generated by wayland-scanner 1.20 and later destroys in the
+         * same call (WL_MARSHAL_FLAG_DESTROY). Older code, such as Debian
+         * 11's GTK, sends the request and then calls wl_proxy_destroy(),
+         * which frees the proxy in webos_xdg_virtual_destroyed(). */
+        if (flags & WL_MARSHAL_FLAG_DESTROY)
+            webos_xdg_destroy_virtual(dying);
     }
     return NULL;
+}
+
+/* Called by our libwayland for wl_proxy_destroy() on a proxy with id 0,
+ * which only virtual proxies have. */
+void webos_xdg_virtual_destroyed(struct wl_proxy *proxy)
+{
+    struct virt *v = virt_get(proxy);
+
+    if (v && v->proxy == proxy)
+        virt_teardown(v);
+    webos_xdg_destroy_virtual(proxy);
 }
 
 static void wrapped_global(void *data, struct wl_registry *registry, uint32_t name,
@@ -1690,11 +1851,74 @@ static const struct wl_keyboard_listener keyboard_wrapper = {
     keyboard_repeat,
 };
 
+/* Writes "library+0xoffset" (or "[heap]+0x..", or "unmapped") for addr. */
+static void where_is(const void *addr, char *out, size_t n)
+{
+    char line[512];
+    FILE *maps = fopen("/proc/self/maps", "r");
+
+    snprintf(out, n, "unmapped");
+    if (!maps)
+        return;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long lo, hi, pgoff;
+        char path[256] = "[anon]";
+        const char *base;
+
+        if (sscanf(line, "%lx-%lx %*s %lx %*s %*s %255s", &lo, &hi, &pgoff, path) >= 3 &&
+            (unsigned long)addr >= lo && (unsigned long)addr < hi) {
+            base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+            snprintf(out, n, "%s+0x%lx", base, (unsigned long)addr - lo + pgoff);
+            break;
+        }
+    }
+    fclose(maps);
+}
+
+/* True if n bytes at p can be read. process_vm_readv fails with EFAULT on
+ * unmapped and on reserved (PROT_NONE) memory, where mincore would not. */
+static int is_readable(const void *p, size_t n)
+{
+    char buf[64];
+    struct iovec local = { buf, n < sizeof buf ? n : sizeof buf };
+    struct iovec remote = { (void *)p, local.iov_len };
+    ssize_t r;
+
+    if (!p)
+        return 0;
+    r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    return r == (ssize_t)local.iov_len || (r < 0 && errno != EFAULT);
+}
+
+/* Interface name for a report, without trusting a possibly freed proxy. */
+static const char *proxy_name(struct wl_proxy *proxy)
+{
+    const struct wl_interface *iface = proxy_iface(proxy);
+
+    if (iface && is_readable(iface, sizeof *iface) && is_readable(iface->name, 1))
+        return iface->name;
+    return "?";
+}
+
+void *webos_xdg_last_caller(void);
+
 void webos_xdg_prepare_listener(struct wl_proxy *proxy, void (***implementation)(void), void **data)
 {
-    const char *name = proxy_iface(proxy) ? proxy_iface(proxy)->name : "";
-    struct virt *v = virt_get(proxy);
+    const struct wl_interface *iface = proxy_iface(proxy);
+    const char *name;
+    struct virt *v;
 
+    if (iface && (!is_readable(iface, sizeof *iface) || !is_readable(iface->name, 1))) {
+        char at[300], by[300];
+
+        where_is(iface, at, sizeof at);
+        where_is(webos_xdg_last_caller(), by, sizeof by);
+        log_msg("listener on proxy %p id %u: interface %p (%s) is not a wl_interface, added by %s",
+                (void *)proxy, wl_proxy_get_id(proxy), (void *)iface, at, by);
+        return;
+    }
+    name = iface ? iface->name : "";
+    v = virt_get(proxy);
     log_msg("listener %s", name);
     if (!strcmp(name, "wl_pointer") || !strcmp(name, "wl_keyboard")) {
         struct hook *hook = hook_slot(!strcmp(name, "wl_pointer") ? pointer_hooks : keyboard_hooks,
@@ -1717,7 +1941,10 @@ void webos_xdg_prepare_listener(struct wl_proxy *proxy, void (***implementation)
     }
     if (strcmp(name, "wl_registry") != 0)
         return;
-    g.registry = (struct wl_registry *)proxy;
+    /* GDK's registry. Mali's EGL makes its own on a private queue and
+     * destroys that queue; objects bound through it would be orphaned. */
+    if (!g.registry && webos_xdg_on_default_queue(proxy))
+        g.registry = (struct wl_registry *)proxy;
     if (!v)
         v = virt_add(proxy, 0);
     if (!v)
@@ -1794,6 +2021,36 @@ static int cursor_surface_request(struct wl_proxy *surface, uint32_t opcode)
     }
 }
 
+/* Our libwayland calls this when asked to wrap a proxy whose event queue
+ * has been destroyed (queue == NULL), before substituting the default queue. */
+void webos_xdg_null_queue_report(struct wl_proxy *proxy, void *caller)
+{
+    static int reports;
+    char by[300];
+
+    if (reports++ >= 12)
+        return;
+    where_is(caller, by, sizeof by);
+    log_msg("wrapping %s@%u whose queue was destroyed, for %s (default queue used)",
+            proxy_name(proxy), wl_proxy_get_id(proxy), by);
+}
+
+/* libwayland aborts when wl_proxy_destroy() is called on a wrapper proxy.
+ * Our patched libwayland frees the wrapper instead and calls this, with the
+ * return address recorded at the public entry point, so the offending
+ * library can be found: resolve the offset with nm/addr2line on that file. */
+void webos_xdg_wrapper_destroy_report(struct wl_proxy *proxy, void *caller)
+{
+    static int reports;
+    char by[300];
+
+    if (reports++ >= 12)
+        return;
+    where_is(caller, by, sizeof by);
+    log_msg("WRAPPER destroyed with wl_proxy_destroy: %s, caller %s (recovered)",
+            proxy_name(proxy), by);
+}
+
 int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
                         const struct wl_interface *interface, uint32_t version,
                         uint32_t flags, union wl_argument *args, struct wl_proxy **out)
@@ -1801,9 +2058,10 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
     const char *name = proxy_iface(proxy) ? proxy_iface(proxy)->name : "";
     struct virt *v;
 
-    (void)flags;
     if (!strcmp(name, "wl_display")) {
-        g.display = (struct wl_display *)proxy;
+        /* The proxy may be a wrapper that Mali's EGL made for its private
+         * queue and frees soon after; keep the display itself. */
+        g.display = webos_xdg_proxy_display(proxy);
         wake_display = g.display;
         /* Queued remote events are applied by remote_sync_done, on the
          * thread that dispatches the display. Draining here ran GDK
@@ -1880,6 +2138,6 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
     if (!v || v->kind == 0)
         return 0;
     log_msg("virt kind %d opcode %u", v->kind, opcode);
-    *out = virt_request(v, opcode, interface, args);
+    *out = virt_request(v, opcode, flags, interface, args);
     return 1;
 }
