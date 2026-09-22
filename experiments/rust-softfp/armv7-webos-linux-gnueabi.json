@@ -1,0 +1,39 @@
+{
+  "abi": "eabi",
+  "arch": "arm",
+  "crt-objects-fallback": "false",
+  "crt-static-respected": true,
+  "data-layout": "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
+  "default-uwtable": true,
+  "dynamic-linking": true,
+  "env": "gnu",
+  "features": "+v7,+thumb2,+vfp3,+neon",
+  "has-rpath": true,
+  "has-thread-local": true,
+  "linker-flavor": "gnu-cc",
+  "llvm-floatabi": "soft",
+  "llvm-mcount-intrinsic": "llvm.arm.gnu.eabi.mcount",
+  "llvm-target": "armv7-unknown-linux-gnueabi",
+  "max-atomic-width": 64,
+  "metadata": {
+    "description": "ARMv7 Linux glibc softfp: FPU and NEON enabled, soft-float calling convention, matching webOS TV userspace. Derived from armv7-unknown-linux-gnueabi.",
+    "host_tools": false,
+    "std": true,
+    "tier": 2
+  },
+  "os": "linux",
+  "position-independent-executables": true,
+  "relro-level": "full",
+  "static-position-independent-executables": true,
+  "supported-split-debuginfo": [
+    "packed",
+    "unpacked",
+    "off"
+  ],
+  "target-family": [
+    "unix"
+  ],
+  "target-mcount": "\u0001__gnu_mcount_nc",
+  "target-pointer-width": 32,
+  "vendor": "webos"
+}

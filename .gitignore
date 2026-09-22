@@ -38,3 +38,7 @@ app/gl-bridge
 *.bak-*
 
 .DS_Store
+
+# Rust build output
+target/
+experiments/*/out/

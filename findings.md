@@ -367,3 +367,60 @@ decode them there.
 **When the remote seems dead**, check `dmesg | grep MR25GB` before blaming the
 app. A Magic Remote whose Bluetooth link is flapping keeps its buttons working
 while the pointer and wheel go silent, which looks exactly like a software bug.
+
+---
+
+## 12. A 32-bit softfp Rust build works on the TV
+
+Tested 2026-09-22 with `experiments/rust-softfp`, built five ways and run on
+the TV. This answers whether Firefox's Rust could target the TV's own 32-bit
+userspace instead of going through the 64-bit bridge.
+
+**Rust already supports softfp.** The official `armv7-linux-androideabi`
+target is softfp (`llvm-floatabi: soft` with `+vfp3d16`). Only 32-bit glibc
+Linux lacks a ready-made softfp target: stock `armv7-unknown-linux-gnueabi`
+is `+soft-float`. Two ways fill the gap:
+
+- Stable Rust on the stock target with
+  `RUSTFLAGS="-C target-feature=-soft-float,+vfp3,+neon"`. rustc warns that
+  these features are unstable but builds. The standard library stays
+  prebuilt soft-float; your own code uses the FPU.
+- A custom target, `armv7-webos-linux-gnueabi.json`, derived from the stock
+  one with only the features changed, on nightly with
+  `-Zbuild-std=std,panic_abort -Zjson-target-spec`. Everything, including
+  the standard library, uses the FPU and NEON.
+
+**Correctness, all 32-bit glibc builds:** results from the TV's own `libm`
+(`pow`, `atan2`, `expf`, `fmaf`) match exactly, and an offscreen render
+through the TV's EGL and GLES reports `Mali-G52`, `OpenGL ES 3.2`, and reads
+back `glClearColor(0.25, 0.5, 0.75, 1)` as `[64, 128, 191, 255]`. Floats
+therefore cross into the TV's 32-bit GPU driver correctly. The binaries need
+glibc 2.34 or 2.35, which the TV has.
+
+**Speed, best of two rounds, ms (TV load average ~18 during the runs):**
+
+| Build | nbody | saxpy | 20M float calls | 2M libm sin |
+|---|---|---|---|---|
+| 32-bit hardfp (static) | 78 | 126 | 248 | 86 |
+| 32-bit softfp, custom target | 87 | 130 | 246 | 77 |
+| 32-bit softfp, stable + features | 89 | 130 | 250 | 80 |
+| 64-bit (static) | 88 | 134 | 223 | 73 |
+| 32-bit stock soft-float | 4,774 | 2,238 | 2,701 | 67 |
+
+softfp, hardfp and 64-bit are within run-to-run noise of each other. The
+calling-convention cost of softfp does not show up even in a loop of 20 million
+float-argument calls. Stock soft-float is 20 to 50 times slower. A Mandelbrot
+benchmark was excluded: the compiler still optimised it away in some builds.
+
+**Conclusion:** the premise that forced the 64-bit bridge does not hold. A
+32-bit Firefox's Rust code can run at full floating-point speed and link
+against the TV's own libraries, including its GPU driver. What remains is the
+rest of a 32-bit build: a cross toolchain with glibc 2.35-compatible headers,
+32-bit builds of Firefox's other dependencies, and Firefox's build system
+accepting a custom or feature-modified Rust target.
+
+**Hardware decoding is not a V4L2 question.** The `/dev/video*` devices and
+the `v4l2_live` kernel driver belong to live input. LG's decoders sit behind
+its own media stack, so hardware video in Firefox would need a decoder module
+for that stack, which is only reachable from a 32-bit build.
+

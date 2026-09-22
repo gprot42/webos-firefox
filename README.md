@@ -4,7 +4,7 @@ Native browser for the OLED55C56LB (webOSTV 25, platform 10.3.1, firmware 33.31.
 
 Firefox is a trademark of the Mozilla Foundation. This packages an unmodified Firefox ESR build for personal use on one TV and ships its own icon artwork, not Mozilla's.
 
-`app/geckotv.sh` runs `app/firefox-runtime/firefox` when that file is present. That runtime is Firefox ESR 153.3, built as 64-bit ARM. Rust has no softfp target, and this TV's libraries are softfp, so a 32-bit Firefox cannot call them. The binary uses the `org.webosbrew.bridge-64to32` loader. Install that bridge before launching Gecko. The highest glibc symbol in this build is GLIBC_2.38. The bridge ships glibc 2.39.
+`app/geckotv.sh` runs `app/firefox-runtime/firefox` when that file is present. That runtime is Firefox ESR 153.3, built as 64-bit ARM. The TV's userspace uses the softfp convention: code runs on the FPU, but floating-point arguments are passed in integer registers. That costs little, and a 32-bit Firefox could call the TV's libraries fine. The obstacle is Rust, which Firefox needs: Rust ships no ready-made target for 32-bit glibc softfp. Its stock `armv7-unknown-linux-gnueabi` matches the calling convention but emulates all floating point in software. A custom target, or target features, can produce softfp code; `findings.md` records how that was tested on the TV. This build takes the simpler 64-bit route instead, at the cost of losing the TV's GPU. The binary uses the `org.webosbrew.bridge-64to32` loader. Install that bridge before launching Firefox. The highest glibc symbol in this build is GLIBC_2.38. The bridge ships glibc 2.39.
 
 Until the runtime exists, the same launcher runs `app/smoke`, a Wayland client that paints a fullscreen GLES frame.
 
