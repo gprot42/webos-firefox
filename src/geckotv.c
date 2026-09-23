@@ -55,6 +55,32 @@ static void give_profile(const char *path, uid_t uid, gid_t gid)
     closedir(dir);
 }
 
+/* The "target" string of the webOS launch parameters, e.g.
+ * {"target":"https://example.org/"}. Only http(s) URLs are accepted; JSON
+ * escapes are not decoded, and a value containing any is rejected. */
+static int launch_target(const char *json, char *out, size_t n)
+{
+    const char *p = strstr(json, "\"target\"");
+    size_t len = 0;
+
+    if (!p)
+        return 0;
+    p += strlen("\"target\"");
+    while (*p == ' ' || *p == ':')
+        p++;
+    if (*p++ != '"')
+        return 0;
+    while (p[len] && p[len] != '"' && p[len] != '\\')
+        len++;
+    if (p[len] != '"' || len == 0 || len >= n)
+        return 0;
+    if (strncmp(p, "http://", 7) != 0 && strncmp(p, "https://", 8) != 0)
+        return 0;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     char exe[PATH_MAX];
@@ -64,6 +90,7 @@ int main(int argc, char **argv)
     char libpath[PATH_MAX * 2];
     char logpath[PATH_MAX];
     char marker[PATH_MAX];
+    char target[2048];
     char *args[12];
     int fd;
     int narg = 0;
@@ -191,6 +218,8 @@ int main(int argc, char **argv)
         int i;
         for (i = 1; i < argc && narg < 10; i++)
             args[narg++] = argv[i];
+    } else if (argc > 1 && launch_target(argv[1], target, sizeof target)) {
+        args[narg++] = target;
     } else {
         args[narg++] = "https://example.com";
     }

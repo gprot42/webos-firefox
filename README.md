@@ -4,7 +4,7 @@ Native browser for the OLED55C56LB (webOSTV 25, platform 10.3.1, firmware 33.31.
 
 Firefox is a trademark of the Mozilla Foundation. This packages a Firefox ESR build for personal use on one TV and ships its own icon artwork, not Mozilla's. The build carries three small build fixes in `build/patches/`.
 
-`app/geckotv` runs `app/firefox-runtime/firefox` when that file is present. That runtime is Firefox ESR 153.3 built as a native 32-bit program (ARMv7, NEON, softfp), the same ABI as the TV's userspace. It runs on the TV's own glibc and libstdc++ and needs nothing else installed. Rust is built for the stock `armv7-unknown-linux-gnueabi` target with the FPU features switched on, so it uses the hardware FPU; `findings.md` section 12 records how that was proven on the TV. Firefox renders on the Mali-G52 through GPU WebRender. Scrolling a long page at 720p, it delivers 125 frames a second on about 105% of one core, where software rendering gives 88 frames on 125%. `findings.md` section 13 has the details and the four fixes GPU rendering needed.
+`app/geckotv` runs `app/firefox-runtime/firefox` when that file is present. That runtime is Firefox ESR 153.3 built as a native 32-bit program (ARMv7, NEON, softfp), the same ABI as the TV's userspace. It runs on the TV's own glibc (2.30 or newer) and needs nothing else installed. libstdc++ is linked statically with its symbols hidden (`build/mozconfig-arm32`, `build/stdcxx-static/`), so Firefox does not depend on the TV's C++ library version; the Mali driver keeps using the TV's copy. Rust is built for the stock `armv7-unknown-linux-gnueabi` target with the FPU features switched on, so it uses the hardware FPU; `findings.md` section 12 records how that was proven on the TV. Firefox renders on the Mali-G52 through GPU WebRender. Scrolling a long page at 720p, it delivers 125 frames a second on about 105% of one core, where software rendering gives 88 frames on 125%. `findings.md` section 13 has the details and the four fixes GPU rendering needed.
 
 An earlier 64-bit build ran through the `org.webosbrew.bridge-64to32` loader with software rendering only. It has been removed; `findings.md` keeps its measurements.
 
@@ -22,6 +22,12 @@ python3 scripts/pack-ipk.py
 ```
 
 `scripts/install2tvfrommacos.sh` builds, packages, and installs to `root@192.168.0.79` with `~/.ssh/webos_deploy` when the TV answers. Ares device name `webos`.
+
+To open a page at launch, pass it as the webOS `target` parameter (http and https only):
+
+```sh
+ares-launch -d webos com.github.gprot42.geckotv -p '{"target":"https://www.youtube.com/"}'
+```
 
 After launch, the log is on the TV at:
 
@@ -45,7 +51,7 @@ Firefox starts without Marionette. To drive it from the Mac, create the marker f
 touch /media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/marionette
 ```
 
-Delete it afterwards. With Marionette on, `navigator.webdriver` is true on every page, a flag that bot checks read. With it on, YouTube stopped sending video after about a minute and showed "Something went wrong"; see `findings.md` section 8.
+Delete it afterwards. With Marionette on, `navigator.webdriver` is true on every page, and YouTube then stops sending video after about a minute and shows "Something went wrong"; see `findings.md` section 8.
 
 ## Reading a crash
 

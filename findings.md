@@ -216,7 +216,7 @@ to `/var/lib/webosbrew/init.d/65-geckotv-zram` to persist.
 
 ---
 
-## 8. Open: YouTube stops after 30 to 80 seconds
+## 8. Fixed: YouTube stopped after 30 to 80 seconds
 
 Playback begins, buffers healthily, then YouTube's own player reports
 **`onError` code 5** and shows "Something went wrong".
@@ -244,7 +244,9 @@ still buffered, then empties the element. YouTube's server is withholding
 video, the pattern for a client it scores as a bot. Every launch until then
 passed `--marionette`, which makes `navigator.webdriver` true on every page.
 The launcher now enables Marionette only when `<app dir>/marionette` exists.
-Whether that alone fixes playback is still to be confirmed.
+Without it the same video played uninterrupted for 3 minutes, until the TV
+was switched off, and the user reports YouTube working. **Never leave
+Marionette on for normal use.**
 
 ## 9. GPU rendering through the 64-bit bridge: a dead end
 
@@ -536,7 +538,9 @@ Four problems stood in the way, found in this order:
    proxies still attached"), then wraps that proxy on every surface. Older
    libwayland left a dangling queue pointer, which wrapping only copied.
    1.22 sets it to NULL and adds wrappers to the queue's proxy list, so
-   `wl_proxy_create_wrapper()` crashed at address `0xc`. Our libwayland now
+   `wl_proxy_create_wrapper()` crashed at address `0xc`. (The TV's own
+   libwayland is `libwayland-client.so.0.20.0`, i.e. 1.20, which is what
+   Mali was built against.) Our libwayland now
    gives such a wrapper the default queue and logs it (at most 12 times:
    "wrapping mali_buffer_sharing@N whose queue was destroyed"). This is
    expected on every launch.
@@ -576,3 +580,36 @@ names.
 **Not started:** hardware video decoding through LG's media stack, which
 needs a custom Firefox decoder module and handling for video shown on a
 separate display plane.
+
+---
+
+## 14. webOS 4: what is known
+
+No webOS 4 TV is available. Two sources so far:
+
+**LG's webOS TV 4.0 emulator** (`Emulator_tv_linux_v4.0.0.zip` from the
+Internet Archive, release `4.0.0-15209 (goldilocks-gayasan)`). It is an x86
+build, so it only gives library versions, not ARM behaviour. Its disk has a
+small unencrypted boot system (glibc **2.24**, libstdc++ **6.0.22**, i.e.
+GCC 6, `GLIBCXX_3.4.22`), and the real system in a LUKS-encrypted partition,
+which was not opened. LG's bundled Open Source Software Notice lists the
+rest: Wayland **1.11.0**, FFmpeg **2.3.6** (`libavcodec.so.55`), GLib 2.48.2,
+Cairo 1.14.6, HarfBuzz 1.2.7, FreeType 2.6.5, fontconfig 2.12.1, libffi
+3.2.1, libxkbcommon 0.6.1, ICU 57.1, NSS 3.23, Qt 5.6.2, Linux 4.8.
+
+**A user's log from a webOS 4 TV** running the old 64-bit build: the TV has
+a 64-bit kernel; the adapter's registry handling and compositor version clamp
+(`wl_compositor` v3, `wl_output` v2) worked; GDK then found **no `wl_seat`**
+and Firefox crashed in `gdk_seat_get_keyboard` on a NULL seat.
+
+**What that means for a webOS 4 build:**
+
+- glibc 2.24 is below this build's floor (2.30, from the Debian 11 sysroot).
+  The sysroot has to move to Debian 9 (glibc 2.24), and the GTK stack and
+  other bundled libraries with it.
+- libstdc++ 6.0.22 is far older than Firefox needs, so libstdc++ is linked
+  statically (see `build/mozconfig-arm32`).
+- The adapter must cope with a compositor that offers no seat at startup.
+- Firefox still tries `libavcodec.so.55`, so the TV's FFmpeg 2.3 may load;
+  which decoders LG built in is unknown.
+- The TV's libwayland is 1.11, older than Mali-era 1.20 on webOS 25.

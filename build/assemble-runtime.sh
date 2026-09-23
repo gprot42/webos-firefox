@@ -9,8 +9,9 @@ SR=/work/sysroot-armel
 OBJ=/work/obj-arm32
 OUT=/src/app/firefox-runtime
 TAR=$(ls "$OBJ"/dist/firefox-*.tar.xz | head -1)
-# The TV's Mali driver needs GLIBCXX_3.4.29, newer than Debian 11's libstdc++,
-# so libstdc++ and libgcc_s must come from the TV, as must the GPU stack.
+# libstdc++ is linked into Firefox statically; the TV's own copy stays on the
+# list because the Mali driver loads it. libgcc_s and the GPU stack also come
+# from the TV.
 TV_ONLY='^(ld-linux\.so\.3|libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libresolv\.so\.2|libutil\.so\.1|libstdc\+\+\.so\.6|libgcc_s\.so\.1|libEGL\.so\.1|libGLESv2\.so\.2|libGLdispatch\.so\.0|libGLX\.so\.0|libGL\.so\.1|libOpenGL\.so\.0|libwayland-egl\.so\.1|libwayland-server\.so\.0|libgbm\.so\.1|libdrm\.so\.2|libpulse.*|libasound\.so\.2)$'
 
 echo "package: $TAR"
@@ -62,9 +63,11 @@ unreadable=$(find "$OUT" -type f ! -perm -o=r | wc -l)
 echo "files not readable by the jail user: $unreadable"
 [ "$unreadable" -eq 0 ] || exit 1
 maxglibc=$(find "$OUT" -type f -exec sh -c 'file -b "$1" | grep -q ELF && objdump -T "$1" 2>/dev/null' _ {} \; | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
-maxcxx=$(find "$OUT" -type f -exec sh -c 'file -b "$1" | grep -q ELF && objdump -T "$1" 2>/dev/null' _ {} \; | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -1)
+maxcxx=$(find "$OUT" -type f -exec sh -c 'file -b "$1" | grep -q ELF && objdump -T "$1" 2>/dev/null' _ {} \; | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -1 || true)
 echo "newest glibc symbol needed: $maxglibc (TV has 2.35)"
-echo "newest libstdc++ symbol needed: $maxcxx (TV provides at least 3.4.29)"
+# libstdc++ is linked statically (build/mozconfig-arm32), so nothing should
+# need the TV's copy.
+echo "newest libstdc++ symbol needed: ${maxcxx:-none, libstdc++ is static}"
 file "$OUT/firefox" | cut -d, -f1-3
 du -sh "$OUT"
 python3 /src/scripts/pack-ipk.py

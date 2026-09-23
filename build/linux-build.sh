@@ -88,6 +88,12 @@ for patch in "$SRC"/build/patches/*.patch; do
     fi
 done
 
+phase "static libstdc++ support"
+mkdir -p "$WORK/stdcxx-static"
+clang-19 --target=arm-linux-gnueabi --sysroot="$WORK/sysroot-armel" -march=armv7-a -mthumb \
+    -mfpu=neon -mfloat-abi=softfp -fPIC -O2 -c "$SRC/build/stdcxx-static/support.c" \
+    -o "$WORK/stdcxx-static/support.o"
+
 phase "configure"
 ./mach configure
 phase "build"

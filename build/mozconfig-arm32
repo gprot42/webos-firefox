@@ -42,4 +42,11 @@ export RUSTFLAGS="-C target-feature=-soft-float,+vfp3,+neon"
 # 2.31 sysroot lacks. The TV provides them at run time, so let the linker
 # accept undefined symbols inside shared libraries; Firefox's own objects are
 # still checked against glibc 2.31. (Set on CC/CXX above.)
+# libstdc++ is linked statically, with its symbols hidden, so Firefox does not
+# depend on the TV's libstdc++ version (older webOS ships an older one). The
+# Mali driver still loads the TV's shared libstdc++ into the same process;
+# hiding ours keeps the driver bound to its own copy. support.o
+# supplies a glibc 2.32 symbol and three atomic helpers the static library needs; it is built by
+# build/linux-build.sh from build/stdcxx-static/support.c.
+export LDFLAGS="-static-libstdc++ -Wl,--exclude-libs,libstdc++.a:libsupc++.a /work/stdcxx-static/support.o"
 mk_add_options MOZ_OBJDIR=/work/obj-arm32
