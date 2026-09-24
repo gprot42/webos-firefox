@@ -1,0 +1,24 @@
+Allow a static libstdc++ on webOS.
+
+Firefox refuses to link libstdc++ statically because official builds must use
+the distribution's copy. On webOS the TV's libstdc++ varies by firmware (GCC 6
+on webOS 4, GCC 11 on webOS 25), so this build links it statically and hides
+its symbols with --exclude-libs (build/mozconfig-arm32, build/mozconfig-nc4);
+the TV's Mali driver keeps using the TV's own copy. Warn instead of failing.
+
+diff --git a/build/moz.configure/flags.configure b/build/moz.configure/flags.configure
+index 4822831ac5..ca83795b4f 100644
+--- a/build/moz.configure/flags.configure
++++ b/build/moz.configure/flags.configure
+@@ -76,7 +76,10 @@ def link_libstdcxx_statically(
+ 
+ @depends(when=link_libstdcxx_statically)
+ def check_libstdcxx_linkage():
+-    die("Firefox does not support linking statically with libstdc++")
++    log.warning(
++        "Linking libstdc++ statically: its symbols must be hidden "
++        "(--exclude-libs) because the TV's GPU driver loads the shared one"
++    )
+ 
+ 
+ check_and_add_flag(

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Pack app/ into a webOS IPK with real timestamps and executable bits.
 
+Each run raises the patch number in app/appinfo.json first (0.1.4 -> 0.1.5);
+pass --no-bump to repack at the current version.
+
 Homebrew ares-package 2.4.0 on Node 22+ writes member dates of 1970-01-01.
 webOS 5 has rejected those packages. This packer follows the same layout
 ares-package writes for a native app.
@@ -8,6 +11,7 @@ ares-package writes for a native app.
 
 import io
 import json
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -79,7 +83,28 @@ def gzip_tar(build) -> bytes:
     return buf.getvalue()
 
 
+def bump_version() -> str:
+    """Raise the last number of app/appinfo.json's version and save it.
+
+    Every package gets a new version: webOS may skip installing a package
+    whose version is already installed, leaving the old files in place.
+    """
+    path = APP / "appinfo.json"
+    appinfo = json.loads(path.read_text())
+    parts = appinfo["version"].split(".")
+    if not all(p.isdigit() for p in parts):
+        raise SystemExit(f"cannot bump version {appinfo['version']!r}")
+    parts[-1] = str(int(parts[-1]) + 1)
+    appinfo["version"] = ".".join(parts)
+    path.write_text(json.dumps(appinfo, indent=2) + "\n")
+    return appinfo["version"]
+
+
 def main() -> None:
+    if "--no-bump" in sys.argv[1:]:
+        print("version not bumped (--no-bump)")
+    else:
+        print(f"version bumped to {bump_version()}")
     appinfo = json.loads((APP / "appinfo.json").read_text())
     app_id = appinfo["id"]
     version = appinfo["version"]

@@ -1,0 +1,54 @@
+# Firefox ESR 153, native 32-bit (ARMv7, NEON, softfp), built against the
+# buildroot-nc4 SDK: glibc 2.12.2, GCC 16's libstdc++, and a GTK 3 stack added
+# by build/nc4/firefox.fragment. Binaries built this way need nothing newer
+# than the glibc every webOS TV has, so one build covers webOS 4 onwards
+# (kernel 3.17+, from the SDK's kernel headers).
+# SDK: build/nc4/build-sdk.sh. Build: MOZCONFIG=/src/build/mozconfig-nc4.
+NC4=/work/nc4/out/host
+NC4_SYSROOT=$NC4/arm-webos-linux-gnueabi/sysroot
+NC4_GCC=$NC4/lib/gcc/arm-webos-linux-gnueabi/16.2.0
+
+ac_add_options --enable-application=browser
+ac_add_options --target=arm-linux-gnueabi
+ac_add_options --with-arch=armv7-a
+ac_add_options --with-fpu=neon
+ac_add_options --with-float-abi=softfp
+ac_add_options --with-thumb=yes
+ac_add_options --with-sysroot=$NC4_SYSROOT
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland-only
+ac_add_options --with-libclang-path=/usr/lib/llvm-19/lib
+ac_add_options --with-clang-path=/usr/bin/clang-19
+ac_add_options --without-wasm-sandboxed-libraries
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+ac_add_options --disable-tests
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --enable-optimize
+ac_add_options --enable-release
+ac_add_options --disable-webrtc
+ac_add_options --disable-accessibility
+ac_add_options --disable-printing
+ac_add_options --disable-parental-controls
+ac_add_options --disable-webspeech
+ac_add_options --disable-synth-speechd
+ac_add_options --disable-profiling
+ac_add_options --disable-geckodriver
+ac_add_options --enable-strip
+ac_add_options --enable-install-strip
+
+# clang takes its C++ headers and libstdc++ from the SDK's GCC 16. That
+# libstdc++ is built for ARMv7 against glibc 2.12, so it needs no __sync
+# helpers and no newer glibc symbols; it is linked statically with its
+# symbols hidden, because the TV's Mali driver loads the TV's own libstdc++.
+export CC="clang-19 --gcc-install-dir=$NC4_GCC -Qunused-arguments"
+export CXX="clang++-19 --gcc-install-dir=$NC4_GCC -Qunused-arguments"
+# glibc 2.12 keeps threads and clock_gettime in libpthread and librt.
+# libglibc_polyfills (from nc4) adds getauxval, which Rust's std needs; it
+# finds the real one with dlsym, which glibc 2.12 keeps in libdl.
+export LDFLAGS="-pthread -static-libstdc++ -Wl,--exclude-libs,libstdc++.a:libsupc++.a -Wl,--push-state,--as-needed -lrt -Wl,--pop-state -lglibc_polyfills -ldl"
+# Constants newer than glibc 2.12's headers, defined only when missing.
+export CFLAGS="-include /src/build/nc4/glibc-compat.h"
+export CXXFLAGS="-include /src/build/nc4/glibc-compat.h"
+export RUSTFLAGS="-C target-feature=-soft-float,+vfp3,+neon"
+mk_add_options MOZ_OBJDIR=/work/obj-nc4

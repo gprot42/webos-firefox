@@ -217,6 +217,17 @@ static void log_msg(const char *fmt, ...)
     fflush(stderr);
 }
 
+/* Reads our own memory without faulting: fails with EFAULT on unmapped or
+ * reserved pages. Called through syscall() because glibc only added the
+ * process_vm_readv() wrapper in 2.15 and older webOS has 2.12. */
+static ssize_t read_own_memory(void *dst, const void *src, size_t n)
+{
+    struct iovec local = { dst, n };
+    struct iovec remote = { (void *)src, n };
+
+    return syscall(SYS_process_vm_readv, getpid(), &local, 1UL, &remote, 1UL, 0UL);
+}
+
 /* Executable mappings, read once in the crash handler without stdio or
  * malloc (the fault may be inside malloc). */
 static char crash_maps[192 * 1024];
@@ -333,14 +344,12 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
     if (webos_printf_trace_get) {
         struct printf_trace *t = &last;
         char fmt[160] = "";
-        struct iovec local = { fmt, sizeof fmt - 1 };
-        struct iovec remote = { (void *)t->fmt, sizeof fmt - 1 };
+        size_t len = sizeof fmt - 1;
 
         /* The format may sit at the end of a mapping: fall back to less. */
-        while (t->fmt && local.iov_len > 8 &&
-               process_vm_readv(getpid(), &local, 1, &remote, 1, 0) < 0)
-            local.iov_len = remote.iov_len = local.iov_len / 2;
-        fmt[local.iov_len] = '\0';
+        while (t->fmt && len > 8 && read_own_memory(fmt, t->fmt, len) < 0)
+            len /= 2;
+        fmt[t->fmt ? len : 0] = '\0';
         for (i = 0; fmt[i]; i++)
             if (fmt[i] == '\n')
                 fmt[i] = '|';
@@ -1875,19 +1884,19 @@ static void where_is(const void *addr, char *out, size_t n)
     fclose(maps);
 }
 
-/* True if n bytes at p can be read. process_vm_readv fails with EFAULT on
+/* True if n bytes at p can be read: read_own_memory() fails with EFAULT on
  * unmapped and on reserved (PROT_NONE) memory, where mincore would not. */
 static int is_readable(const void *p, size_t n)
 {
     char buf[64];
-    struct iovec local = { buf, n < sizeof buf ? n : sizeof buf };
-    struct iovec remote = { (void *)p, local.iov_len };
     ssize_t r;
 
     if (!p)
         return 0;
-    r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-    return r == (ssize_t)local.iov_len || (r < 0 && errno != EFAULT);
+    if (n > sizeof buf)
+        n = sizeof buf;
+    r = read_own_memory(buf, p, n);
+    return r == (ssize_t)n || (r < 0 && errno != EFAULT);
 }
 
 /* Interface name for a report, without trusting a possibly freed proxy. */

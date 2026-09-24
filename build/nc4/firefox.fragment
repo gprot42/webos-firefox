@@ -1,0 +1,21 @@
+# Added to buildroot-nc4's configs/webos_tv_defconfig to build an SDK that
+# can compile Firefox: GTK 3 (Wayland only) and its dependencies, against the
+# same glibc 2.12 as the stock nc4 SDK.
+
+# GTK's Wayland backend requires kernel headers 3.17 (memfd_create). Binaries
+# built with this SDK then need a 3.17+ kernel; webOS 4 TVs run 4.x.
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_3_17=y
+# The line above only declares the minimum; this picks the headers built.
+BR2_DEFAULT_KERNEL_VERSION="3.17.8"
+
+BR2_PACKAGE_LIBGTK3=y
+BR2_PACKAGE_LIBGTK3_WAYLAND=y
+# BR2_PACKAGE_LIBGTK3_X11 is not set
+# BR2_PACKAGE_LIBGTK3_BROADWAY is not set
+# BR2_PACKAGE_LIBGTK3_DEMO is not set
+# BR2_PACKAGE_LIBGTK3_TESTS is not set
+BR2_PACKAGE_CAIRO=y
+BR2_PACKAGE_PANGO=y
+BR2_PACKAGE_HARFBUZZ=y
+BR2_PACKAGE_GDK_PIXBUF=y
+BR2_PACKAGE_LIBDRM=y

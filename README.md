@@ -21,6 +21,8 @@ make
 python3 scripts/pack-ipk.py
 ```
 
+`scripts/pack-ipk.py` raises the last number of the version in `app/appinfo.json` on every run (0.1.4 becomes 0.1.5), because webOS may skip installing a package whose version is already installed; `--no-bump` repacks at the current version.
+
 `scripts/install2tvfrommacos.sh` builds, packages, and installs to `root@192.168.0.79` with `~/.ssh/webos_deploy` when the TV answers. Ares device name `webos`.
 
 To open a page at launch, pass it as the webOS `target` parameter (http and https only):
@@ -64,6 +66,19 @@ touch /media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/way
 ```
 
 The launcher then sets `WAYLAND_DEBUG=1`, and libwayland logs every request and event into `geckotv.log`.
+
+## Portable build (buildroot-nc4, glibc 2.12)
+
+`build/mozconfig-nc4` builds the same Firefox against the [buildroot-nc4](https://github.com/openlgtv/buildroot-nc4) SDK instead of Debian: glibc 2.12.2, GCC 16's libstdc++ (linked statically), and a GTK 3 stack added by `build/nc4/firefox.fragment`. Every shipped file, bundled libraries included, needs nothing newer than glibc 2.12, so one package is meant to run on webOS 4 and later (kernel 3.17 or newer). Tested on the webOS 25 TV: GPU WebRender, codecs, menus and YouTube work as with the Debian build. Steps, inside the `ffbuild` container, after `build/linux-build.sh` has fetched and patched the Firefox source:
+
+```sh
+podman exec -u builder ffbuild bash /src/build/nc4/build-sdk.sh   # SDK with GTK, ~1 h
+podman exec ffbuild env CROSS=nc4 OUT=/work/nc4/adapter bash /src/build/build-adapter.sh
+podman exec -u builder ffbuild bash -c 'export RUSTUP_HOME=/work/rustup CARGO_HOME=/work/cargo PATH=/work/cargo/bin:$PATH MOZBUILD_STATE_PATH=/work/mozbuild MOZCONFIG=/src/build/mozconfig-nc4; cd /work/firefox && ./mach build && ./mach package'
+podman exec ffbuild env TOOLCHAIN=nc4 bash /src/build/assemble-runtime.sh
+```
+
+`build/nc4/glibc-check.sh <dir>` lists anything that would need a newer glibc. `build/nc4/glibc-compat.h` supplies the few constants and declarations glibc 2.12's headers lack.
 
 ## Firefox ESR 153
 

@@ -222,13 +222,19 @@ mb.write_text(m)
 print("patched")
 PY
 cd "$WL"
-# 32-bit ARMv7 softfp, against the Debian armel sysroot (build/arm32-cross.ini).
-if [[ ! -f build-arm32/build.ninja ]]; then
-    meson setup build-arm32 --cross-file "$ROOT/build/arm32-cross.ini" \
+# 32-bit ARMv7 softfp. Default: the Debian armel sysroot (build/arm32-cross.ini).
+# CROSS=nc4 builds against the buildroot-nc4 SDK instead (build/nc4/cross.ini).
+case "${CROSS:-arm32}" in
+    nc4) CROSS_FILE=$ROOT/build/nc4/cross.ini; BUILD=build-nc4 ;;
+    *) CROSS_FILE=$ROOT/build/arm32-cross.ini; BUILD=build-arm32 ;;
+esac
+if [[ ! -f $BUILD/build.ninja ]]; then
+    meson setup "$BUILD" --cross-file "$CROSS_FILE" \
         -Ddocumentation=false -Ddtd_validation=false -Dtests=false -Dscanner=false
 fi
-ninja -C build-arm32 src/libwayland-client.so.0.22.0
-mkdir -p "$ROOT/app/firefox-runtime"
-install -m 0755 build-arm32/src/libwayland-client.so.0.22.0 "$ROOT/app/firefox-runtime/libwayland-client.so.0"
+ninja -C "$BUILD" src/libwayland-client.so.0.22.0
+OUT=${OUT:-$ROOT/app/firefox-runtime}
+mkdir -p "$OUT"
+install -m 0755 "$BUILD/src/libwayland-client.so.0.22.0" "$OUT/libwayland-client.so.0"
 echo ADAPTER_OK
-file "$ROOT/app/firefox-runtime/libwayland-client.so.0"
+file "$OUT/libwayland-client.so.0"

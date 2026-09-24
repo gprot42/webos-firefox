@@ -613,3 +613,55 @@ and Firefox crashed in `gdk_seat_get_keyboard` on a NULL seat.
 - Firefox still tries `libavcodec.so.55`, so the TV's FFmpeg 2.3 may load;
   which decoders LG built in is unknown.
 - The TV's libwayland is 1.11, older than Mali-era 1.20 on webOS 25.
+
+---
+
+## 15. Portable build against buildroot-nc4 (glibc 2.12)
+
+Built 2026-09-24 so one package covers webOS 4 onwards. The nc4 SDK
+(openlgtv/buildroot-nc4, commit `322ff04e`) targets every webOS TV: ARMv7
+NEON softfp, GCC 16.2, glibc 2.12.2 with a small `glibc-polyfills` library.
+
+**Checked first, on the webOS 25 TV:** a Rust program (threads, TLS, files,
+hashing, time) and a C++20 program, both built against nc4, ran correctly.
+Rust's std needs `getauxval` (glibc 2.16), which the polyfills provide.
+clang 19 accepts GCC 16.2's C++ headers. nc4's `libstdc++.a` is built for
+ARMv7 against glibc 2.12, so it needs neither the `__sync_*` helpers nor the
+`__libc_single_threaded` stand-in the Debian build needs.
+
+**The SDK** (`build/nc4/build-sdk.sh`, `build/nc4/firefox.fragment`) adds
+GTK 3 (Wayland only), Pango, Cairo, HarfBuzz, GDK-Pixbuf, at-spi2-core and
+libdrm to nc4's `webos_tv_defconfig`. Changes needed:
+
+- Kernel headers 3.17 (`BR2_DEFAULT_KERNEL_VERSION`; the `..._CUSTOM_3_17`
+  option alone only declares the minimum). GTK's Wayland backend needs
+  `memfd_create`. Binaries then need a 3.17+ kernel.
+- Wayland 1.18.0 and wayland-protocols 1.20 instead of nc4's 1.11 pins (GTK
+  needs 1.14.91 and 1.17). Both are the last autotools releases, which nc4's
+  package files use; checksums match upstream Buildroot. The TVs are not
+  affected: Firefox bundles its own libwayland-client, the adapter.
+- Serial top-level build, as nc4 does: with per-package directories nc4's
+  `glibc-polyfills` finds no compiler.
+
+**Firefox against it** (`build/mozconfig-nc4`) needed:
+
+- `build/patches/allow-static-libstdcxx.patch`: configure refuses a static
+  libstdc++. The Debian build only passed that check because its test
+  program failed to link.
+- `build/nc4/glibc-compat.h`, force-included: `MADV_*`, `O_PATH`,
+  `AT_EMPTY_PATH`, `AT_NO_AUTOMOUNT` constants; `secure_getenv` mapped to
+  `__secure_getenv` (exported by glibc 2.12, and still by 2.35 as
+  `@GLIBC_2.4`); a `putenv` declaration for NSS. The header must include no
+  system header (it comes before each file's `_GNU_SOURCE`) and must give
+  glibc functions default visibility (Firefox hides symbols by default).
+- `-lrt -ldl` (glibc 2.12 keeps these apart) and `-lglibc_polyfills`.
+- The adapter calls `process_vm_readv` through `syscall()` (the glibc
+  wrapper is 2.15).
+
+**Result:** all 57 files of the runtime need glibc 2.12 or older
+(`build/nc4/glibc-check.sh`), none needs the TV's libstdc++. Runtime 248 MB,
+package 0.1.5 103 MB (Debian-based 0.1.4: 107 MB). On the webOS 25 TV: GPU
+WebRender, all codecs, Wikipedia, menus, and 3.5 minutes of YouTube without
+Marionette. Untested on a webOS 4 TV; there the missing `wl_seat` (section
+14) is still expected to stop it.
+
