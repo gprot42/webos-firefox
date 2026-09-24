@@ -67,6 +67,32 @@ touch /media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/way
 
 The launcher then sets `WAYLAND_DEBUG=1`, and libwayland logs every request and event into `geckotv.log`.
 
+## Build requirements
+
+Building Firefox takes a lot of disk space, memory and time. Everything runs in a Linux container (`ffbuild`, podman), whose `/work` volume holds the source, toolchains and build output. Measured on an Apple Silicon Mac with a podman VM of 12 CPUs, 48 GB RAM and a 140 GB disk:
+
+| | Disk |
+|---|---|
+| Firefox source (`/work/firefox`) | 5.6 GB |
+| Firefox build output, per toolchain (`/work/obj-arm32`, `/work/obj-nc4`) | 3.7 GB each |
+| Rust toolchain and cargo | 2.5 GB |
+| Debian armel sysroot (Debian build only) | 0.7 GB |
+| buildroot-nc4 SDK build, plus 1.8 GB of downloads (portable build only) | 22 GB |
+| Everything, both builds | 39 GB |
+
+Allow at least **60 GB free** for one build and 100 GB for both: build output grows beyond these finished sizes while linking.
+
+**CPU and memory.** Firefox's build runs one compile job per core and estimates 1 GB of RAM per job, so plan on at least 16 GB of RAM (32 GB or more is comfortable); linking `libxul.so` alone needs several GB. With 12 cores:
+
+| Step | Time |
+|---|---|
+| First full Firefox build, Rust included | about 1.5 to 2 hours |
+| Rebuild after a change to C/C++ flags or a forced header | about 25 to 30 minutes |
+| Relink after changing only link flags | a few minutes |
+| buildroot-nc4 SDK with GTK (serial at the top level, as nc4 builds) | about 45 to 60 minutes |
+
+Fewer cores scale these up roughly in proportion. The package itself is about 100 MB and the installed runtime about 250 MB on the TV.
+
 ## Portable build (buildroot-nc4, glibc 2.12)
 
 `build/mozconfig-nc4` builds the same Firefox against the [buildroot-nc4](https://github.com/openlgtv/buildroot-nc4) SDK instead of Debian: glibc 2.12.2, GCC 16's libstdc++ (linked statically), and a GTK 3 stack added by `build/nc4/firefox.fragment`. Every shipped file, bundled libraries included, needs nothing newer than glibc 2.12, so one package is meant to run on webOS 4 and later (kernel 3.17 or newer). Tested on the webOS 25 TV: GPU WebRender, codecs, menus and YouTube work as with the Debian build. Steps, inside the `ffbuild` container, after `build/linux-build.sh` has fetched and patched the Firefox source:
