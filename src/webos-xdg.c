@@ -24,13 +24,14 @@
 #include "webos-input-manager-client-protocol.h"
 #include "text-model-client-protocol.h"
 #include "text-input-unstable-v3-client-protocol.h"
+#include "webos-surface-group-client-protocol.h"
 
 /* Compiled into libwayland-client. Requests are intercepted after
  * libwayland has parsed the argument list, then translated onto the
  * wl_shell and wl_webos_shell globals this compositor actually exports.
  */
 
-#define MAX_VIRT 48
+#define MAX_VIRT 96
 
 extern struct wl_proxy *webos_xdg_create_virtual(struct wl_proxy *factory,
                                                   const struct wl_interface *interface,
@@ -52,7 +53,13 @@ enum virt_kind {
     V_TOPLEVEL,
     V_POPUP,
     V_TEXT_INPUT_MANAGER,
-    V_TEXT_INPUT
+    V_TEXT_INPUT,
+    /* Stand-ins for compositors without these globals (webOS 4). */
+    V_DATA_DEVICE_MANAGER,
+    V_DATA_SOURCE,
+    V_DATA_DEVICE,
+    V_SUBCOMPOSITOR,
+    V_SUBSURFACE
 };
 
 struct virt {
@@ -66,7 +73,12 @@ struct virt {
     struct wl_subsurface *subsurface;
     uint32_t version;
     int injected;
+    int injected_ddm;
+    int injected_sub;
     int configured;
+    /* V_SUBSURFACE: the surfaces it joins, as Firefox asked. */
+    struct wl_proxy *sub_child;
+    struct wl_proxy *sub_parent;
     /* xdg_positioner state, and the resolved popup geometry. */
     int32_t p_w, p_h;
     int32_t p_ax, p_ay, p_aw, p_ah;
@@ -92,9 +104,35 @@ static uint32_t host_webos_name;
 static uint32_t host_input_name;
 static uint32_t host_text_name;
 static uint32_t host_seat_name;
+static uint32_t host_seat_version;
 static uint32_t host_shm_name;
 static uint32_t host_compositor_name;
 static uint32_t host_subcompositor_name;
+static uint32_t host_data_device_manager_name;
+static uint32_t host_group_name;
+/* webOS 4 has no wl_subcompositor: Firefox's content surface is shown as a
+ * layer of a webOS surface group rooted at the main window instead. */
+static struct wl_webos_surface_group_compositor *group_compositor;
+static struct wl_webos_surface_group *main_group;
+static struct wl_surface *group_root;
+static int groups_made;
+/* One slot per surface shown through the group: the surface, its wl_shell
+ * role (kept while the surface lives: GTK shows the same surface again, and
+ * a second role request is a protocol error), and whether it is attached.
+ * Slot i uses layer "content<i+1>". Layers and groups are never destroyed:
+ * webOS 4's versions of these interfaces have fewer requests than
+ * webos-surface-group.xml, so destroy has another opcode there ("invalid
+ * method 2", seen in LG's webOS TV 4.0 emulator). Only create_surface_group,
+ * create_layer, attach and detach are used, which were tested there. */
+#define MAX_LAYERED 8
+static struct {
+    struct wl_proxy *surface;
+    struct wl_shell_surface *shell;
+    int attached;
+} layered[MAX_LAYERED];
+static struct wl_webos_surface_group_layer *layers[MAX_LAYERED];
+#define DATA_DEVICE_MANAGER_NAME 0x7f000003
+#define SUBCOMPOSITOR_NAME 0x7f000004
 static struct wl_subcompositor *our_subcompositor;
 /* Surfaces GDK names in wl_pointer.set_cursor. LSM maps any surface that
  * gets content as a card (FullscreenView.checkFullscreen checks neither
@@ -603,7 +641,14 @@ static const char *our_app_id(void)
     return appid;
 }
 
+static void tag_surface_as(struct wl_proxy *surface, const char *type);
+
 static void tag_child_surface(struct wl_proxy *surface)
+{
+    tag_surface_as(surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
+}
+
+static void tag_surface_as(struct wl_proxy *surface, const char *type)
 {
     struct wl_webos_shell_surface *ss;
     int i;
@@ -631,10 +676,9 @@ static void tag_child_surface(struct wl_proxy *surface)
     /* An appId keeps it out of the nameless-card path, and the type keeps
      * it out of FullscreenView. No model claims this type. */
     wl_webos_shell_surface_set_property(ss, "appId", our_app_id());
-    wl_webos_shell_surface_set_property(ss, "_WEBOS_WINDOW_TYPE",
-                                        "_WEBOS_WINDOW_TYPE_SUBSURFACE");
+    wl_webos_shell_surface_set_property(ss, "_WEBOS_WINDOW_TYPE", type);
     wl_webos_shell_surface_set_property(ss, "displayAffinity", "0");
-    log_msg("tagged child surface %p, not a card", (void *)surface);
+    log_msg("tagged child surface %p as %s", (void *)surface, type);
 }
 
 static void emit_toplevel_configure(struct virt *toplevel)
@@ -813,12 +857,211 @@ static void text_input_commit(struct virt *v)
         l->done(v->data, (struct zwp_text_input_v3 *)v->proxy, text_input_commits);
 }
 
+/* A surface Firefox made a subsurface of the main window, shown instead as
+ * a surface-group layer (webOS 4). Input the compositor sends to it goes to
+ * the main window, which is the surface GTK knows. */
+static int layered_slot(struct wl_proxy *surface)
+{
+    int i;
+
+    for (i = 0; surface && i < MAX_LAYERED; i++)
+        if (layered[i].surface == surface)
+            return i;
+    return -1;
+}
+
+static int is_layered(struct wl_surface *surface)
+{
+    int i = layered_slot((struct wl_proxy *)surface);
+
+    return i >= 0 && layered[i].attached;
+}
+
+static struct wl_surface *input_surface(struct wl_surface *surface)
+{
+    return is_layered(surface) && main_surface ? main_surface : surface;
+}
+
+static void attach_slot(int i)
+{
+    char name[24];
+
+    if (!main_group || layered[i].attached)
+        return;
+    snprintf(name, sizeof name, "content%d", i + 1);
+    if (!layers[i])
+        layers[i] = wl_webos_surface_group_create_layer(main_group, name, i + 1);
+    wl_webos_surface_group_attach(main_group, (struct wl_surface *)layered[i].surface, name);
+    layered[i].attached = 1;
+    log_msg("subsurface %p shown as group layer %s", (void *)layered[i].surface, name);
+}
+
+static void detach_slot(int i)
+{
+    if (!layered[i].attached)
+        return;
+    if (main_group)
+        wl_webos_surface_group_detach(main_group, (struct wl_surface *)layered[i].surface);
+    layered[i].attached = 0;
+    log_msg("subsurface %p no longer shown", (void *)layered[i].surface);
+}
+
+/* The surface itself is going away. */
+static void forget_slot(int i)
+{
+    detach_slot(i);
+    if (layered[i].shell)
+        wl_shell_surface_destroy(layered[i].shell);
+    layered[i].surface = NULL;
+    layered[i].shell = NULL;
+}
+
+/* The main window changed: its group stays with the old window. */
+static void drop_group(void)
+{
+    int i;
+
+    for (i = 0; i < MAX_LAYERED; i++) {
+        detach_slot(i);
+        layers[i] = NULL;
+    }
+    main_group = NULL;
+    group_root = NULL;
+}
+
+/* webOS 4: show a subsurface of the main window as a layer above it. Layers
+ * are laid out like the window itself (the group protocol has no positions),
+ * which suits Firefox's content surface. Other subsurfaces, and pop-ups GTK
+ * places away from the origin, are not shown yet. */
+static void emulate_subsurface(struct wl_proxy *child, struct wl_proxy *parent)
+{
+    int i;
+
+    tag_child_surface(child);
+    if (!child || !parent || parent != (struct wl_proxy *)main_surface) {
+        log_msg("subsurface %p of %p not shown (no wl_subcompositor)", (void *)child,
+                (void *)parent);
+        return;
+    }
+    if (!group_compositor && host_group_name && g.registry) {
+        group_compositor = wl_registry_bind(g.registry, host_group_name,
+                                            &wl_webos_surface_group_compositor_interface, 1);
+        log_msg("surface group compositor %p", (void *)group_compositor);
+    }
+    if (!group_compositor) {
+        log_msg("no surface groups either: subsurface %p not shown", (void *)child);
+        return;
+    }
+    if (main_group && group_root != main_surface)
+        drop_group();
+    if (!main_group) {
+        /* Group names must be unique; the old window's group is not destroyed. */
+        char name[128];
+
+        if (groups_made++)
+            snprintf(name, sizeof name, "%s-%d", our_app_id(), groups_made);
+        else
+            snprintf(name, sizeof name, "%s", our_app_id());
+        main_group = wl_webos_surface_group_compositor_create_surface_group(
+            group_compositor, main_surface, name);
+        group_root = main_surface;
+        log_msg("surface group %p for the main window", (void *)main_group);
+    }
+    i = layered_slot(child);
+    for (int j = 0; i < 0 && j < MAX_LAYERED; j++)
+        if (!layered[j].surface)
+            i = j;
+    if (i < 0) {
+        log_msg("too many layers: subsurface %p not shown", (void *)child);
+        return;
+    }
+    layered[i].surface = child;
+    /* webOS 4 only shows a group member that is a window in its own right: a
+     * bare surface stays invisible (tested in the emulator). Being in the
+     * group keeps it from taking over the screen as a card. */
+    bind_named();
+    if (!layered[i].shell && g.shell) {
+        layered[i].shell = wl_shell_get_shell_surface(g.shell, (struct wl_surface *)child);
+        wl_shell_surface_add_listener(layered[i].shell, &shell_listener, NULL);
+        wl_shell_surface_set_toplevel(layered[i].shell);
+    }
+    attach_slot(i);
+}
+
+/* wl_subsurface.set_position: a layer cannot be moved, so an offset surface
+ * (a pop-up) is taken out of view rather than shown in the wrong place. */
+static void layered_position(struct wl_proxy *child, int32_t x, int32_t y)
+{
+    int i = layered_slot(child);
+
+    if (i < 0)
+        return;
+    if (x || y) {
+        log_msg("subsurface %p moved to %d,%d: layers cannot be offset", (void *)child, x, y);
+        detach_slot(i);
+    } else {
+        attach_slot(i);
+    }
+}
+
+static void unlayer_surface(struct wl_proxy *child)
+{
+    int i = layered_slot(child);
+
+    if (i >= 0)
+        detach_slot(i);
+}
+
 static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t flags,
                                      const struct wl_interface *interface,
                                      union wl_argument *args)
 {
     struct wl_proxy *created;
     struct virt *child;
+
+    /* Stand-ins for missing globals. Their destructors are not opcode 0
+     * (wl_data_source.offer is), so they skip the generic handling below. */
+    if (v->kind == V_DATA_DEVICE_MANAGER || v->kind == V_DATA_SOURCE ||
+        v->kind == V_DATA_DEVICE || v->kind == V_SUBCOMPOSITOR || v->kind == V_SUBSURFACE) {
+        int destructor = 0;
+
+        if (v->kind == V_DATA_DEVICE_MANAGER) {
+            if (opcode == WL_DATA_DEVICE_MANAGER_CREATE_DATA_SOURCE)
+                return new_virt(v->proxy, interface, v->version, V_DATA_SOURCE, NULL);
+            if (opcode == WL_DATA_DEVICE_MANAGER_GET_DATA_DEVICE)
+                return new_virt(v->proxy, interface, v->version, V_DATA_DEVICE, NULL);
+        } else if (v->kind == V_DATA_SOURCE) {
+            destructor = opcode == WL_DATA_SOURCE_DESTROY;
+        } else if (v->kind == V_DATA_DEVICE) {
+            destructor = opcode == WL_DATA_DEVICE_RELEASE;
+        } else if (v->kind == V_SUBCOMPOSITOR) {
+            if (opcode == WL_SUBCOMPOSITOR_GET_SUBSURFACE && args) {
+                created = new_virt(v->proxy, interface, v->version, V_SUBSURFACE, &child);
+                if (child) {
+                    child->sub_child = (struct wl_proxy *)args[1].o;
+                    child->sub_parent = (struct wl_proxy *)args[2].o;
+                    emulate_subsurface(child->sub_child, child->sub_parent);
+                }
+                return created;
+            }
+            destructor = opcode == WL_SUBCOMPOSITOR_DESTROY;
+        } else if (v->kind == V_SUBSURFACE) {
+            if (opcode == WL_SUBSURFACE_SET_POSITION && args)
+                layered_position(v->sub_child, args[0].i, args[1].i);
+            if (opcode == WL_SUBSURFACE_DESTROY) {
+                unlayer_surface(v->sub_child);
+                destructor = 1;
+            }
+        }
+        if (destructor && v->proxy) {
+            struct wl_proxy *dying = v->proxy;
+
+            virt_teardown(v);
+            if (flags & WL_MARSHAL_FLAG_DESTROY)
+                webos_xdg_destroy_virtual(dying);
+        }
+        return NULL;
+    }
 
     if (v->kind == V_WM && opcode == XDG_WM_BASE_GET_XDG_SURFACE) {
         created = new_virt(v->proxy, interface, v->version, V_SURFACE, &child);
@@ -964,6 +1207,22 @@ void webos_xdg_virtual_destroyed(struct wl_proxy *proxy)
     webos_xdg_destroy_virtual(proxy);
 }
 
+/* Testing aid: WEBOS_XDG_AS_WEBOS4=1 hides the globals webOS 4's compositor
+ * lacks, so the stand-ins below can be tried on a newer TV. */
+static int as_webos4(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("WEBOS_XDG_AS_WEBOS4");
+
+        on = e && *e == '1';
+        if (on)
+            log_msg("acting as on webOS 4: no wl_subcompositor, no wl_data_device_manager");
+    }
+    return on;
+}
+
 static void wrapped_global(void *data, struct wl_registry *registry, uint32_t name,
                            const char *interface, uint32_t version)
 {
@@ -975,6 +1234,27 @@ static void wrapped_global(void *data, struct wl_registry *registry, uint32_t na
     user_global = (reg && reg->listener)
         ? ((void (**)(void *, struct wl_registry *, uint32_t, const char *, uint32_t))reg->listener)[0]
         : NULL;
+    /* List what this compositor offers once, from the first registry: which
+     * globals exist differs by webOS version (webOS 4 lacks wl_subcompositor
+     * and wl_seat, which Firefox and GTK need). */
+    {
+        /* By name: registry objects are reused after Firefox and the Mali
+         * driver destroy their temporary ones, so "first registry" is not
+         * a reliable test. */
+        static char seen[48][40];
+        static int nseen;
+        int i;
+
+        for (i = 0; i < nseen && strcmp(seen[i], interface) != 0; i++)
+            ;
+        if (i == nseen && nseen < 48) {
+            snprintf(seen[nseen++], sizeof seen[0], "%s", interface);
+            log_msg("compositor offers %s v%u (name %u)", interface, version, name);
+        }
+    }
+    if (as_webos4() && (!strcmp(interface, "wl_subcompositor") ||
+                        !strcmp(interface, "wl_data_device_manager")))
+        return;
     if (!strcmp(interface, "wl_shell"))
         host_shell_name = name;
     if (!strcmp(interface, "wl_webos_shell"))
@@ -983,12 +1263,35 @@ static void wrapped_global(void *data, struct wl_registry *registry, uint32_t na
         host_input_name = name;
     if (!strcmp(interface, "text_model_factory"))
         host_text_name = name;
-    if (!strcmp(interface, "wl_seat") && !host_seat_name)
+    if (!strcmp(interface, "wl_seat") && !host_seat_name) {
         host_seat_name = name;
+        host_seat_version = version;
+    }
     if (!strcmp(interface, "wl_shm") && !host_shm_name)
         host_shm_name = name;
     if (!strcmp(interface, "wl_subcompositor") && !host_subcompositor_name)
         host_subcompositor_name = name;
+    if (!strcmp(interface, "wl_data_device_manager") && !host_data_device_manager_name)
+        host_data_device_manager_name = name;
+    if (!strcmp(interface, "wl_webos_surface_group_compositor") && !host_group_name)
+        host_group_name = name;
+    /* GTK sets up no seat until wl_data_device_manager exists; webOS 4 has
+     * none, so without this GTK has no keyboard or pointer at all. */
+    if (!strcmp(interface, "wl_seat") && !host_data_device_manager_name && user_global &&
+        reg && !reg->injected_ddm) {
+        reg->injected_ddm = 1;
+        log_msg("inject wl_data_device_manager (the compositor has none)");
+        user_global(data, registry, DATA_DEVICE_MANAGER_NAME, "wl_data_device_manager", 3);
+    }
+    /* Firefox refuses to start without wl_subcompositor. Compositors list it
+     * right after wl_compositor; if the next global is something else, this
+     * one has none (webOS 4). */
+    if (strcmp(interface, "wl_compositor") && strcmp(interface, "wl_subcompositor") &&
+        !host_subcompositor_name && user_global && reg && reg->injected && !reg->injected_sub) {
+        reg->injected_sub = 1;
+        log_msg("inject wl_subcompositor (the compositor has none)");
+        user_global(data, registry, SUBCOMPOSITOR_NAME, "wl_subcompositor", 1);
+    }
     if (!strcmp(interface, "wl_compositor")) {
         if (!host_compositor_name)
             host_compositor_name = name;
@@ -1411,7 +1714,9 @@ static void ensure_text_model(void)
     if (!g.registry)
         return;
     if (!our_seat && host_seat_name) {
-        our_seat = wl_registry_bind(g.registry, host_seat_name, &wl_seat_interface, 4);
+        /* webOS 4's seat is version 2; binding above that is a protocol error. */
+        our_seat = wl_registry_bind(g.registry, host_seat_name, &wl_seat_interface,
+                                    host_seat_version < 4 ? host_seat_version : 4);
         log_msg("our seat %p", (void *)our_seat);
     }
     if (text_input || !host_text_name)
@@ -1431,6 +1736,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    surface = input_surface(surface);
     last_x = x >> 8;
     last_y = y >> 8;
     saw_motion = 1;
@@ -1447,6 +1753,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    surface = input_surface(surface);
     if (synth_focus == surface)
         synth_focus = NULL;
     log_msg("POINTER leave surface=%p", (void *)surface);
@@ -1910,6 +2217,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
 
     focused_keys = hook;
+    surface = input_surface(surface);
     log_msg("KEYBOARD enter surface=%p", (void *)surface);
     /* LSM treats a popup subsurface as separately focusable and hands it the
      * keyboard. GTK reads that as its toplevel losing focus and deactivates
@@ -1929,6 +2237,7 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
     struct hook *hook = hook_find(keyboard_hooks, keyboard);
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
 
+    surface = input_surface(surface);
     log_msg("KEYBOARD leave surface=%p", (void *)surface);
     if (is_popup_surface(surface)) {
         log_msg("  swallowed: popup keyboard leave");
@@ -2222,6 +2531,17 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
     }
 
     if (!strcmp(name, "wl_registry") && opcode == WL_REGISTRY_BIND && interface && args) {
+        if (args[0].u == DATA_DEVICE_MANAGER_NAME &&
+            !strcmp(interface->name, "wl_data_device_manager")) {
+            *out = new_virt(proxy, interface, version, V_DATA_DEVICE_MANAGER, NULL);
+            log_msg("bound virtual wl_data_device_manager");
+            return 1;
+        }
+        if (args[0].u == SUBCOMPOSITOR_NAME && !strcmp(interface->name, "wl_subcompositor")) {
+            *out = new_virt(proxy, interface, version, V_SUBCOMPOSITOR, NULL);
+            log_msg("bound virtual wl_subcompositor");
+            return 1;
+        }
         if (!strcmp(interface->name, "zwp_text_input_manager_v3")) {
             *out = new_virt(proxy, interface, version, V_TEXT_INPUT_MANAGER, NULL);
             text_input_bound = 1;
@@ -2252,8 +2572,11 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
      * MozContainer, must be tagged before it ever carries content. */
     if (!strcmp(name, "wl_subcompositor") && opcode == WL_SUBCOMPOSITOR_GET_SUBSURFACE &&
         args) {
-        tag_child_surface((struct wl_proxy *)args[1].o);
-        return 0;
+        /* Our stand-in (webOS 4) is handled below, not by the compositor. */
+        if (!virt_get(proxy)) {
+            tag_child_surface((struct wl_proxy *)args[1].o);
+            return 0;
+        }
     }
 
     /* The TV draws the Magic Remote pointer. Remember the surface GDK
@@ -2264,6 +2587,16 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
             cursor_surface_add((struct wl_proxy *)args[1].o);
         *out = NULL;
         return 1;
+    }
+    /* webOS 4: take a surface out of its group while its proxy can still be
+     * named in the request. */
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_DESTROY) {
+        int slot = layered_slot(proxy);
+
+        if (slot >= 0)
+            forget_slot(slot);
+        if (main_group && (struct wl_surface *)proxy == group_root)
+            drop_group();
     }
     if (!strcmp(name, "wl_surface") && cursor_surface_request(proxy, opcode)) {
         *out = NULL;

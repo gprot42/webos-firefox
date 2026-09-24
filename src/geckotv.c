@@ -231,6 +231,16 @@ int main(int argc, char **argv)
     }
     setenv("APPID", "com.github.gprot42.geckotv", 0);
 
+    /* Started by hand as root: Firefox refuses to run as root with a profile
+     * owned by the app's own user and only says "Running Nightly as root". */
+    {
+        struct stat st;
+        if (geteuid() == 0 && stat(home, &st) == 0 && st.st_uid != 0)
+            fprintf(stderr, "geckotv: running as root, but the profile belongs to uid %u; "
+                            "Firefox will refuse. Start the app from the TV (or ares-launch) "
+                            "instead of running geckotv from a root shell.\n",
+                    (unsigned)st.st_uid);
+    }
     fprintf(stderr, "geckotv exec %s\n", firefox);
     args[narg++] = firefox;
     args[narg++] = "--profile";

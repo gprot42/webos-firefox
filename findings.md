@@ -747,3 +747,48 @@ is kernel 3.17.
 test client run when no runtime is installed) is the only file linked
 against `libEGL`, `libGLESv2` and `libwayland-webos-client` directly.
 
+
+---
+
+## 18. webOS 4 on LG's emulator: compositor, fixes, what works
+
+Tested 2026-09-24 on LG's webOS TV 4.0 emulator in QEMU (build/emu/README.md)
+with a 32-bit x86 build of Firefox and the same adapter code as the TV build.
+
+**The compositor** offers what a user's webOS 4 TV log showed: `wl_compositor`
+v3, `wl_shm` v1, `wl_output` v2, `wl_seat` v2, `wl_shell`,
+`wl_webos_shell`, `text_model_factory`, `wl_webos_surface_group_compositor`,
+and **no `wl_subcompositor`, no `wl_data_device_manager`**. It also has
+LSM's surface groups. Its UI runs at 1280x720 scaled to 1080p.
+
+**Why 0.1.9 crashed there:** GTK sets up no seat without
+`wl_data_device_manager` (`gdk_seat_get_keyboard` assertion), and Firefox
+asserts on a missing `wl_subcompositor` in `nsWaylandDisplay::Init`.
+
+**The adapter now (only when those globals are missing):**
+- offers a do-nothing `wl_data_device_manager` (clipboard stays inside
+  Firefox) and a stand-in `wl_subcompositor`;
+- shows Firefox's content surface, a subsurface of the main window, as a
+  layer of a surface group rooted at the main window. webOS 4 only displays a
+  group member that has a `wl_shell` toplevel role; a bare surface stays
+  invisible even as a group member. Group membership keeps it from being
+  fullscreened as a separate card (`getForegroundAppInfo` lists the window as
+  group owner plus member);
+- never destroys layers or groups: webOS 4's versions of those interfaces
+  lack requests the XML has, so `destroy` has another opcode there and
+  sending opcode 2 was a fatal protocol error ("invalid method 2"). Layers are
+  reused; a surface keeps its `wl_shell` role while it lives, because asking
+  for a second one is also fatal;
+- binds `wl_seat` at no more than the compositor's version (v2 there).
+
+**Works in the emulator:** start, page rendering, clicks (pointer events
+arrive on the layer), typing through the hardware keyboard, and the webOS
+keyboard opening for the address bar.
+
+**Not yet:** menus and other pop-ups are invisible on webOS 4 (layers cannot
+be offset; pop-ups need another mechanism), but opening and closing them no
+longer crashes. The GPU path (Mali, `wl_mali`) cannot be tested in the
+emulator; for TVs without `libwayland-egl.so.1` the runtime now ships
+`src/wayland-egl-shim.c`, which uses the GPU driver's own `wl_egl_window`
+functions when the driver has them (older Mali drivers do, with their own
+struct) and the generic ones otherwise.

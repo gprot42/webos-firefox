@@ -1,0 +1,40 @@
+# Firefox ESR 153 as a 32-bit x86 program, only for testing on LG's webOS TV
+# 4.0 emulator, which is a 32-bit x86 system. Same options as the TV builds
+# (build/mozconfig-nc4), against Debian 12 i386 (build/emu/sysroot-i386.sh).
+# Not for TVs. Build: build/emu/build-i686.sh.
+SR=/work/sysroot-i386
+
+ac_add_options --enable-application=browser
+# Not i686-pc-linux-gnu: rustc has two i686 Linux targets (unknown, oe) and
+# Firefox cannot pick one for the "pc" vendor.
+ac_add_options --target=i686-unknown-linux-gnu
+ac_add_options --with-sysroot=$SR
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland-only
+ac_add_options --with-libclang-path=/usr/lib/llvm-19/lib
+ac_add_options --with-clang-path=/usr/bin/clang-19
+ac_add_options --without-wasm-sandboxed-libraries
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+ac_add_options --disable-tests
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --enable-optimize
+ac_add_options --enable-release
+ac_add_options --disable-webrtc
+ac_add_options --disable-accessibility
+ac_add_options --disable-printing
+ac_add_options --disable-parental-controls
+ac_add_options --disable-webspeech
+ac_add_options --disable-synth-speechd
+ac_add_options --disable-profiling
+ac_add_options --disable-geckodriver
+ac_add_options --enable-strip
+ac_add_options --enable-install-strip
+
+export CC=clang-19
+export CXX=clang++-19
+# libstdc++ statically, as on the TV. The emulator's glibc (2.24) is older
+# than bookworm's, so build/emu/assemble-emu.sh points the executables at a
+# bundled copy of bookworm's glibc and loader.
+export LDFLAGS="-static-libstdc++ -Wl,--exclude-libs,libstdc++.a:libsupc++.a"
+mk_add_options MOZ_OBJDIR=/work/obj-i686

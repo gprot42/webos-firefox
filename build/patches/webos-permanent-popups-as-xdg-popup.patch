@@ -1,0 +1,35 @@
+Map permanent popups as xdg_popups on webOS.
+
+Firefox keeps noautohide panels (the add-on install prompt, among others)
+out of its popup hierarchy and gives them GDK_WINDOW_TYPE_HINT_UTILITY,
+which GTK maps as a plain wl_subsurface. The webOS compositor never shows
+those, so the prompt stayed invisible and add-ons could not be installed
+from addons.mozilla.org. Give them the popup-menu hint instead: GTK then
+maps them as xdg_popups, which the webOS adapter shows as its own
+subsurfaces and never dismisses on outside clicks. They stay untracked, as
+upstream; tracking them instead made Firefox close them at once, since
+they are not in layout's popup list.
+
+reverted
+diff --git a/widget/gtk/nsWindowWayland.cpp b/widget/gtk/nsWindowWayland.cpp
+index 69ae6a6c20..091c9286e3 100644
+--- a/widget/gtk/nsWindowWayland.cpp
++++ b/widget/gtk/nsWindowWayland.cpp
+@@ -1453,10 +1453,13 @@ bool nsWindowWayland::WaylandPopupConfigure() {
+   }
+ 
+   if (!mPopupTrackInHierarchy) {
+-    // GDK_WINDOW_TYPE_HINT_UTILITY is mapped as wl_subsurface
+-    // by default.
+-    LOG("  not tracked in popup hierarchy, switch to Utility");
+-    gtkTypeHint = GDK_WINDOW_TYPE_HINT_UTILITY;
++    // webOS: GDK maps GDK_WINDOW_TYPE_HINT_UTILITY as a plain wl_subsurface,
++    // which the webOS compositor never displays (the add-on install prompt
++    // stayed invisible). Map untracked (permanent) popups as xdg_popups
++    // instead; the webOS adapter shows those and never dismisses them on
++    // outside clicks. They stay out of the popup hierarchy, as upstream.
++    LOG("  not tracked in popup hierarchy, map as xdg_popup (webOS)");
++    gtkTypeHint = GDK_WINDOW_TYPE_HINT_POPUP_MENU;
+   }
+   gtk_window_set_type_hint(GTK_WINDOW(mShell), gtkTypeHint);
+ 

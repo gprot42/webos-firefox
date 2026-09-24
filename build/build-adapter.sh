@@ -17,6 +17,12 @@ wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-
 # header is needed; GTK supplies the interface data when it binds.
 wayland-scanner client-header /usr/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml \
     "$GEN/text-input-unstable-v3-client-protocol.h"
+# webOS surface groups (LG, Apache-2.0, from webosose/webos-wayland-extensions):
+# used to show Firefox's content surface on webOS 4, which has no subsurfaces.
+wayland-scanner client-header "$ROOT/src/webos-surface-group.xml" \
+    "$GEN/webos-surface-group-client-protocol.h"
+wayland-scanner private-code "$ROOT/src/webos-surface-group.xml" \
+    "$GEN/webos-surface-group-protocol.c"
 wayland-scanner client-header "$ROOT/src/webos-shell.xml" \
     "$GEN/wayland-webos-shell-client-protocol.h"
 wayland-scanner private-code "$ROOT/src/webos-shell.xml" "$GEN/webos-shell-protocol.c"
@@ -222,6 +228,11 @@ if "text-model-protocol.c" not in m:
     if needle not in m:
         raise SystemExit("input manager source missing")
     m = m.replace(needle, "'webos-input-manager-protocol.c',\n\t'text-model-protocol.c'", 1)
+if "webos-surface-group-protocol.c" not in m:
+    needle = "'text-model-protocol.c'"
+    if needle not in m:
+        raise SystemExit("text model source missing")
+    m = m.replace(needle, "'text-model-protocol.c',\n\t'webos-surface-group-protocol.c'", 1)
 mb.write_text(m)
 print("patched")
 PY
@@ -231,6 +242,8 @@ cd "$WL"
 # (build/nc4/cross.ini), like every library bundled with the nc4 build.
 case "${CROSS:-arm32}" in
     nc4) CROSS_FILE=$ROOT/build/nc4/cross.ini; BUILD=build-nc4 ;;
+    # Only for testing on the webOS 4 emulator (build/emu/).
+    i686) CROSS_FILE=$ROOT/build/emu/i686-cross.ini; BUILD=build-i686 ;;
     *) CROSS_FILE=$ROOT/build/arm32-cross.ini; BUILD=build-arm32 ;;
 esac
 if [[ ! -f $BUILD/build.ninja ]]; then

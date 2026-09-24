@@ -17,15 +17,31 @@ case "${TOOLCHAIN:-arm32}" in
         LIBDIRS="$SR/lib $SR/usr/lib"
         ADAPTER=/tmp/wayland-1.22.0/build-nc4/src/libwayland-client.so.0.22.0
         ADAPTER_HINT="CROSS=nc4 build/build-adapter.sh" ;;
+    i686)
+        # Only for testing on the webOS 4 emulator (build/emu/assemble-emu.sh).
+        SR=/work/sysroot-i386
+        OBJ=/work/obj-i686
+        MULTIARCH=i386-linux-gnu
+        LIBDIRS="$SR/lib/$MULTIARCH $SR/usr/lib/$MULTIARCH"
+        ADAPTER=/tmp/wayland-1.22.0/build-i686/src/libwayland-client.so.0.22.0
+        ADAPTER_HINT="CROSS=i686 build/build-adapter.sh" ;;
     *)
         SR=/work/sysroot-armel
         OBJ=/work/obj-arm32
-        LIBDIRS="$SR/lib/arm-linux-gnueabi $SR/usr/lib/arm-linux-gnueabi"
+        MULTIARCH=arm-linux-gnueabi
+        LIBDIRS="$SR/lib/$MULTIARCH $SR/usr/lib/$MULTIARCH"
         ADAPTER=/tmp/wayland-1.22.0/build-arm32/src/libwayland-client.so.0.22.0
         ADAPTER_HINT="build/build-adapter.sh" ;;
 esac
 OUT=${OUT:-/src/app/firefox-runtime}
 TAR=$(ls "$OBJ"/dist/firefox-*.tar.xz | head -1)
+# The runtime comes from the package tarball, which only `mach package`
+# refreshes: after a `mach build binaries` it still holds the old libxul (0.1.7
+# and 0.1.8 shipped without a Firefox patch this way).
+if [ "$OBJ/dist/bin/libxul.so" -nt "$TAR" ]; then
+    echo "$TAR is older than $OBJ/dist/bin/libxul.so: run ./mach package first"
+    exit 1
+fi
 # libstdc++ is linked into Firefox statically; the TV's own copy stays on the
 # list because the Mali driver loads it. libgcc_s and the GPU stack also come
 # from the TV.
@@ -43,13 +59,14 @@ mkdir -p "$OUT/defaults/pref" && cp /src/app/defaults/pref/00-webos.js "$OUT/def
 
 # Image decoders for GTK. nc4's gdk-pixbuf has PNG and JPEG built in, so it
 # needs no loader modules or cache.
-case "${TOOLCHAIN:-arm32}" in nc4*) ;; *)
+# Debian 12's (the emulator test build) likewise.
+case "${TOOLCHAIN:-arm32}" in nc4*|i686) ;; *)
 # Debian's gdk-pixbuf loads PNG, JPEG and the rest as
 # plug-ins listed in loaders.cache; without them GTK aborts on its first icon
 # ("Failed to load image-missing.png: Unrecognized image file format"). The
 # cache holds absolute paths on the TV; build/gdk-pixbuf-loaders.cache was
 # generated there with the bundled gdk-pixbuf-query-loaders.
-PB=$SR/usr/lib/arm-linux-gnueabi/gdk-pixbuf-2.0
+PB=$SR/usr/lib/$MULTIARCH/gdk-pixbuf-2.0
 mkdir -p "$OUT/gdk-pixbuf/loaders"
 for l in png jpeg gif ico bmp xpm; do cp -L "$PB/2.10.0/loaders/libpixbufloader-$l.so" "$OUT/gdk-pixbuf/loaders/"; done
 cp -L "$PB/gdk-pixbuf-query-loaders" "$OUT/gdk-pixbuf/"
@@ -62,16 +79,23 @@ cp -L "$PB/gdk-pixbuf-query-loaders" "$OUT/gdk-pixbuf/"
 # gtk-query-immodules-3.0); the launcher points GTK_IM_MODULE_FILE at it.
 case "${TOOLCHAIN:-arm32}" in
     nc4*) IMDIR=$SR/usr/lib/gtk-3.0/3.0.0/immodules ;;
-    *) IMDIR=$SR/usr/lib/arm-linux-gnueabi/gtk-3.0/3.0.0/immodules ;;
+    *) IMDIR=$SR/usr/lib/$MULTIARCH/gtk-3.0/3.0.0/immodules ;;
 esac
 # libwayland-egl.so.1 is left to the TV (its Mali driver is built against
-# the TV's copy), but webOS 4 has none. Bundle a generic one where only the
-# launcher adds it to the library path, and only when the TV lacks its own.
+# the TV's copy), but webOS 4 has none. Bundle our own where only the
+# launcher adds it to the library path, and only when the TV lacks its own:
+# it hands the calls to the GPU driver when the driver implements them, as
+# older Mali drivers do with their own struct (src/wayland-egl-shim.c).
+ARM_FLAGS="-march=armv7-a -mthumb -mfpu=neon -mfloat-abi=softfp"
+case "${TOOLCHAIN:-arm32}" in
+    nc4*) SHIM_CC="/work/nc4/out/host/bin/arm-webos-linux-gnueabi-gcc $ARM_FLAGS" ;;
+    i686) SHIM_CC="clang-19 --target=i686-linux-gnu --sysroot=$SR -fuse-ld=lld" ;;
+    *) SHIM_CC="clang-19 --target=arm-linux-gnueabi --sysroot=$SR -fuse-ld=lld $ARM_FLAGS" ;;
+esac
 mkdir -p "$OUT/fallback"
-for d in $LIBDIRS; do
-    [ -e "$d/libwayland-egl.so.1" ] && { cp -L "$d/libwayland-egl.so.1" "$OUT/fallback/"; break; }
-done
-[ -f "$OUT/fallback/libwayland-egl.so.1" ] || { echo "libwayland-egl.so.1 not found in the sysroot"; exit 1; }
+$SHIM_CC -O2 -Wall -fPIC -shared \
+    -fvisibility=hidden -Wl,-soname,libwayland-egl.so.1 \
+    -o "$OUT/fallback/libwayland-egl.so.1" /src/src/wayland-egl-shim.c -ldl
 # GLib/GTK runtime data, bundled so nothing depends on what the TV has:
 #  - compiled GSettings schemas: GTK aborts if one it asks for is missing
 #    (org.gtk.Settings.FileChooser when a page opens a file picker);
