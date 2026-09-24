@@ -665,3 +665,85 @@ WebRender, all codecs, Wikipedia, menus, and 3.5 minutes of YouTube without
 Marionette. Untested on a webOS 4 TV; there the missing `wl_seat` (section
 14) is still expected to stop it.
 
+---
+
+## 16. Experiment: Firefox compiled by GCC instead of clang (does not work)
+
+Goal: one toolchain, with nc4's GCC 16.2 and GNU ld compiling and linking
+Firefox's C and C++ (`build/mozconfig-nc4-gcc`). Rust stays with rustc, and
+bindgen needs libclang whatever compiles the C++.
+
+**Build problems, both solved:**
+
+- bindgen's libclang found the container's own cross GCC 13 headers instead
+  of nc4's GCC 16 (`bits/c++config.h` not found), which broke the Rust
+  bindings. Fixed with `BINDGEN_CFLAGS=--gcc-install-dir=<nc4 GCC 16>`.
+  (With clang as the compiler this came for free through `--gcc-install-dir`
+  in `CC`.)
+- `libmozinference.so` (llama.cpp) failed to link on `__extendhfsf2`: with
+  `-mfpu=neon` GCC 16 calls that half-float helper, which its ARM libgcc only
+  has as `__gnu_h2f_ieee`. nc4 builds everything with `neon-fp16`, whose
+  conversion instructions all NEON webOS CPUs have; using it fixes the link.
+
+**Result:** all binaries need glibc 2.12 or older and no shared libstdc++,
+but Firefox crashes (SIGSEGV) two seconds after start in
+`Servo_GetComputedKeyframeValues`, Rust style code called from GCC-compiled
+C++. Rust reads C++ structures through bindgen-generated layouts, computed
+with clang; a crash there points to GCC laying out at least one structure
+differently on 32-bit ARM. Mozilla tests GCC builds only on x86-64. Finding
+the mismatch would take layout checks across several full rebuilds.
+
+**Size, even if fixed:** `libxul.so` 143.3 MB against clang's 129.5 MB. Code
+(`.text`) is 95.5 MB against 86.5 MB (+10%), and GNU ld cannot pack
+relocations on 32-bit ARM (3.8 MB `.rel.dyn` against LLD's 0.1 MB
+`.relr.dyn`), all of which are processed at every start. The package was
+75 MB against 56 MB for the Firefox tarball.
+
+**Decision:** Firefox stays with clang 19 and LLD. Everything else in the nc4
+build comes from nc4's GCC 16.2: the SDK's libraries, the C++ library linked
+into Firefox, the adapter (`CROSS=nc4`) and the launcher (Makefile `TC=`).
+Enabling GCC's `-Wl,--exclude-libs` hiding and static libstdc++ worked the
+same way as with clang.
+
+---
+
+## 17. What the nc4 runtime takes from the TV, and what it bundles
+
+Audited on package 0.1.7 (unpacked), for webOS 4 in particular.
+
+**Taken from the TV** (all old enough for webOS 4):
+
+| Library | Newest version needed | webOS 4 |
+|---|---|---|
+| glibc (`libc`, `libm`, `libpthread`, `libdl`, `librt`, `libresolv`, `ld-linux.so.3`) | GLIBC_2.12 | 2.24 |
+| `libgcc_s.so.1` | GCC_4.3.0 | GCC 6 |
+| `libasound.so.2` | ALSA_0.9 | alsa-lib 1.1.2 |
+
+Opened at run time, all optional or present: `libEGL`/`libGLESv2` (GPU),
+`libpulse.so.0`, `libavcodec.so.53` to `.63` (webOS 4 has `.55`),
+`libgbm`/`libdrm` (DMA-BUF), `libudev`. No file carries `DT_RELR` (Firefox's
+relrhack handles LLD's packed relocations), and the executables' ELF ABI tag
+is kernel 3.17.
+
+**Bundled because the TV's copy may be missing or wrong for our GLib/GTK:**
+
+- `fallback/libwayland-egl.so.1`: added to the library path by the launcher
+  only if the TV has none (webOS 4); webOS 25 keeps its own, which its Mali
+  driver is built against.
+- `glib-schemas/gschemas.compiled` (`GSETTINGS_SCHEMA_DIR`, with
+  `GSETTINGS_BACKEND=memory`): GTK aborts when a schema it asks for is
+  missing, e.g. `org.gtk.Settings.FileChooser` when a page opens a file
+  picker.
+- `gio-modules/`, empty (`GIO_MODULE_DIR`): otherwise GLib 2.88 would load
+  the TV's GIO plug-ins, built for its own GLib (2.48 on webOS 4).
+- `xkb/` from xkeyboard-config 2.38, added to the nc4 SDK
+  (`XKB_CONFIG_ROOT`): xkbcommon 1.9 rejects LG's keymap ("Keycode too big",
+  keycodes above 0xfff) and builds a default keymap from this data instead.
+- `gtk-immodules/` (`GTK_IM_MODULE_FILE`): GTK's Wayland input-method module
+  (section on the on-screen keyboard).
+
+`build/nc4/glibc-check.sh` checks every file against glibc 2.12;
+`build/assemble-runtime.sh` runs it on each nc4 runtime. `smoke` (the GLES
+test client run when no runtime is installed) is the only file linked
+against `libEGL`, `libGLESv2` and `libwayland-webos-client` directly.
+

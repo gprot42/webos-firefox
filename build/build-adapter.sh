@@ -13,6 +13,10 @@ if [[ ! -f $WL/src/wayland-client.c ]]; then
 fi
 wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml \
     "$GEN/xdg-shell-client-protocol.h"
+# text-input-v3: GTK's own protocol for "an editable field has focus". Only the
+# header is needed; GTK supplies the interface data when it binds.
+wayland-scanner client-header /usr/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml \
+    "$GEN/text-input-unstable-v3-client-protocol.h"
 wayland-scanner client-header "$ROOT/src/webos-shell.xml" \
     "$GEN/wayland-webos-shell-client-protocol.h"
 wayland-scanner private-code "$ROOT/src/webos-shell.xml" "$GEN/webos-shell-protocol.c"
@@ -223,7 +227,8 @@ print("patched")
 PY
 cd "$WL"
 # 32-bit ARMv7 softfp. Default: the Debian armel sysroot (build/arm32-cross.ini).
-# CROSS=nc4 builds against the buildroot-nc4 SDK instead (build/nc4/cross.ini).
+# CROSS=nc4 builds with the buildroot-nc4 SDK's own GCC instead
+# (build/nc4/cross.ini), like every library bundled with the nc4 build.
 case "${CROSS:-arm32}" in
     nc4) CROSS_FILE=$ROOT/build/nc4/cross.ini; BUILD=build-nc4 ;;
     *) CROSS_FILE=$ROOT/build/arm32-cross.ini; BUILD=build-arm32 ;;

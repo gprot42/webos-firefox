@@ -19,3 +19,9 @@ BR2_PACKAGE_PANGO=y
 BR2_PACKAGE_HARFBUZZ=y
 BR2_PACKAGE_GDK_PIXBUF=y
 BR2_PACKAGE_LIBDRM=y
+
+# Keyboard-map data for libxkbcommon. When the compositor's keymap is
+# rejected (LG's has keycodes above 0xfff, which xkbcommon 1.9 refuses), GTK
+# falls back to a default keymap built from this data; it is bundled rather
+# than taken from the TV, whose copy may be missing (webOS 4) or differ.
+BR2_PACKAGE_XKEYBOARD_CONFIG=y

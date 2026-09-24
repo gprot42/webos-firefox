@@ -145,10 +145,43 @@ int main(int argc, char **argv)
     /* The runtime's own libraries come first; its copy of libwayland-client
      * carries the webOS shell adapter. Everything else is the TV's. */
     snprintf(libpath, sizeof libpath, "%s/firefox-runtime", dir);
+    /* GTK needs libwayland-egl.so.1 to load. Newer webOS has it, matched to
+     * its Mali driver, and must keep using its own; webOS 4 has none, so
+     * then use the generic one bundled in firefox-runtime/fallback. */
+    if (access("/usr/lib/libwayland-egl.so.1", F_OK) != 0 &&
+        access("/lib/libwayland-egl.so.1", F_OK) != 0) {
+        size_t len = strlen(libpath);
+        snprintf(libpath + len, sizeof libpath - len, ":%s/firefox-runtime/fallback", dir);
+        fprintf(stderr, "geckotv: no libwayland-egl.so.1 on this TV, using the bundled one\n");
+    }
     /* The runtime's GTK finds its image decoders through this cache. */
     snprintf(marker, sizeof marker, "%s/firefox-runtime/gdk-pixbuf/loaders.cache", dir);
     if (access(marker, R_OK) == 0)
         setenv("GDK_PIXBUF_MODULE_FILE", marker, 1);
+    /* GTK's Wayland input-method module: it tells the adapter when an
+     * editable field gains or loses focus, which opens and closes the webOS
+     * keyboard for text fields in pages, not only the address bar. */
+    snprintf(marker, sizeof marker, "%s/firefox-runtime/gtk-immodules/immodules.cache", dir);
+    if (access(marker, R_OK) == 0)
+        setenv("GTK_IM_MODULE_FILE", marker, 1);
+    /* GLib data bundled with the runtime rather than taken from the TV, whose
+     * copies may be missing or built for another GLib: compiled GSettings
+     * schemas (GTK aborts on a missing one), no GIO plug-ins, settings kept
+     * in memory, and keyboard-map data for xkbcommon's fallback keymap. */
+    snprintf(marker, sizeof marker, "%s/firefox-runtime/glib-schemas/gschemas.compiled", dir);
+    if (access(marker, R_OK) == 0) {
+        snprintf(marker, sizeof marker, "%s/firefox-runtime/glib-schemas", dir);
+        setenv("GSETTINGS_SCHEMA_DIR", marker, 1);
+        setenv("GSETTINGS_BACKEND", "memory", 1);
+    }
+    snprintf(marker, sizeof marker, "%s/firefox-runtime/gio-modules", dir);
+    if (access(marker, R_OK) == 0)
+        setenv("GIO_MODULE_DIR", marker, 1);
+    snprintf(marker, sizeof marker, "%s/firefox-runtime/xkb/rules", dir);
+    if (access(marker, R_OK) == 0) {
+        snprintf(marker, sizeof marker, "%s/firefox-runtime/xkb", dir);
+        setenv("XKB_CONFIG_ROOT", marker, 1);
+    }
 
     setenv("HOME", home, 1);
     setenv("XDG_CONFIG_HOME", home, 0);

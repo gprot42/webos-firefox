@@ -1,3 +1,9 @@
+# webOS toolchain: any buildroot-nc4 SDK (same compiler name and layout).
+# The launcher shipped with the nc4 build is built with the nc4 SDK from
+# build/nc4/build-sdk.sh, inside the ffbuild container:
+#   podman exec -u builder ffbuild make -C /src -B TC=/work/nc4/out/host app/geckotv
+# The default below is an older macOS-hosted SDK (GCC 12.2, glibc 2.12.2)
+# for building on the Mac; its output needs the same glibc.
 TC ?= /Users/aicoder/toolchains/arm-webos-linux-gnueabi_sdk-buildroot
 CC := $(TC)/bin/arm-webos-linux-gnueabi-gcc
 SYSROOT := $(TC)/arm-webos-linux-gnueabi/sysroot

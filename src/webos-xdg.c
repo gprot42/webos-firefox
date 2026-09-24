@@ -23,6 +23,7 @@
 #include "wayland-webos-shell-client-protocol.h"
 #include "webos-input-manager-client-protocol.h"
 #include "text-model-client-protocol.h"
+#include "text-input-unstable-v3-client-protocol.h"
 
 /* Compiled into libwayland-client. Requests are intercepted after
  * libwayland has parsed the argument list, then translated onto the
@@ -49,7 +50,9 @@ enum virt_kind {
     V_POSITIONER,
     V_SURFACE,
     V_TOPLEVEL,
-    V_POPUP
+    V_POPUP,
+    V_TEXT_INPUT_MANAGER,
+    V_TEXT_INPUT
 };
 
 struct virt {
@@ -172,6 +175,7 @@ static int wake_pending_flag;
 
 static void show_keyboard(void);
 static void hide_keyboard(void);
+static void text_input_enter_main(void);
 static void ensure_text_model(void);
 static void start_remote_pointer(void);
 static uint32_t server_compositor_version;
@@ -381,6 +385,9 @@ __attribute__((constructor)) static void webos_xdg_init(void)
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
     read_window_size();
     log_msg("ready, window %dx%d", win_w, win_h);
     start_remote_pointer();
@@ -698,6 +705,7 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
     fullscreen = !mapped_one;
     main_surface = (struct wl_surface *)wl_surface;
     mapped_one = 1;
+    text_input_enter_main();
     if (g.webos) {
         xdg_surface->webos_surface = wl_webos_shell_get_shell_surface(
             g.webos, (struct wl_surface *)wl_surface);
@@ -740,6 +748,71 @@ static void virt_teardown(struct virt *v)
     v->proxy = NULL;
 }
 
+/* text-input-v3, offered to GTK by the adapter. GTK enables text input when
+ * an editable element gains focus and disables it when focus leaves, which is
+ * exactly when the webOS keyboard should come and go; the webOS compositor
+ * does not offer the protocol itself. The keyboard only opens for a focus
+ * that follows a click, so address-bar focus on a new tab or a page's
+ * autofocus does not pop it up. Text still arrives through text_model and
+ * inject_text(). */
+#define TEXT_INPUT_NAME 0x7f000002
+static struct wl_proxy *text_input_v3;
+static int text_input_bound;
+static int text_input_pending, text_input_enabled;
+static uint32_t text_input_commits;
+static int text_input_entered;
+static struct timespec last_click;
+
+static void note_click(void)
+{
+    clock_gettime(CLOCK_MONOTONIC, &last_click);
+}
+
+static int clicked_recently(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - last_click.tv_sec) * 1000 +
+           (now.tv_nsec - last_click.tv_nsec) / 1000000 < 1500;
+}
+
+/* GTK only enables text input on a surface it has been told it entered. */
+static void text_input_enter_main(void)
+{
+    struct virt *v = text_input_v3 ? virt_get(text_input_v3) : NULL;
+    const struct zwp_text_input_v3_listener *l;
+
+    if (!v || !v->listener || !main_surface || text_input_entered)
+        return;
+    l = v->listener;
+    text_input_entered = 1;
+    if (l->enter)
+        l->enter(v->data, (struct zwp_text_input_v3 *)v->proxy, main_surface);
+    log_msg("text-input enter main surface");
+}
+
+static void text_input_commit(struct virt *v)
+{
+    const struct zwp_text_input_v3_listener *l = v->listener;
+
+    text_input_commits++;
+    if (text_input_pending != text_input_enabled) {
+        text_input_enabled = text_input_pending;
+        log_msg("text-input %s", text_input_enabled ? "enabled" : "disabled");
+        if (!text_input_enabled)
+            hide_keyboard();
+        else if (clicked_recently())
+            show_keyboard();
+    } else if (text_input_enabled && !keyboard_up && clicked_recently()) {
+        /* A click on the field that already has focus (after Back closed
+         * the keyboard) only moves the cursor: reopen the keyboard. */
+        show_keyboard();
+    }
+    if (l && l->done)
+        l->done(v->data, (struct zwp_text_input_v3 *)v->proxy, text_input_commits);
+}
+
 static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t flags,
                                      const struct wl_interface *interface,
                                      union wl_argument *args)
@@ -755,6 +828,23 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
     }
     if (v->kind == V_WM && opcode == XDG_WM_BASE_CREATE_POSITIONER) {
         return new_virt(v->proxy, interface, v->version, V_POSITIONER, NULL);
+    }
+    if (v->kind == V_TEXT_INPUT_MANAGER && opcode == ZWP_TEXT_INPUT_MANAGER_V3_GET_TEXT_INPUT) {
+        created = new_virt(v->proxy, interface, v->version, V_TEXT_INPUT, NULL);
+        text_input_v3 = created;
+        text_input_entered = 0;
+        log_msg("text-input created");
+        return created;
+    }
+    if (v->kind == V_TEXT_INPUT) {
+        if (opcode == ZWP_TEXT_INPUT_V3_ENABLE)
+            text_input_pending = 1;
+        else if (opcode == ZWP_TEXT_INPUT_V3_DISABLE)
+            text_input_pending = 0;
+        else if (opcode == ZWP_TEXT_INPUT_V3_COMMIT)
+            text_input_commit(v);
+        else if (opcode == 0 && v->proxy == text_input_v3)
+            text_input_v3 = NULL;
     }
     if (v->kind == V_POSITIONER && args) {
         switch (opcode) {
@@ -923,6 +1013,8 @@ static void wrapped_global(void *data, struct wl_registry *registry, uint32_t na
         g.xdg_name = 0x7f000001;
         log_msg("inject xdg_wm_base");
         user_global(data, registry, g.xdg_name, "xdg_wm_base", 4);
+        log_msg("inject zwp_text_input_manager_v3");
+        user_global(data, registry, TEXT_INPUT_NAME, "zwp_text_input_manager_v3", 1);
     }
 }
 
@@ -1219,8 +1311,29 @@ static void text_keysym(void *data, struct text_model *model, uint32_t serial, u
     (void)serial;
     (void)time;
     (void)modifiers;
-    if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
-        log_msg("keysym %u", sym);
+    if (state != WL_KEYBOARD_KEY_STATE_PRESSED)
+        return;
+    /* The webOS keyboard sends editing keys as X11 keysyms rather than as
+     * text or delete_surrounding_text (it has no surrounding text from us):
+     * BackSpace arrives as 0xff08. Press the matching evdev key. */
+    switch (sym) {
+    case 0xff08: inject_key(KEY_BACKSPACE, 0); break;
+    case 0xff09: inject_key(KEY_TAB, 0); break;
+    case 0xff0d: /* Return */
+    case 0xff8d: inject_key(KEY_ENTER, 0); break; /* KP_Enter */
+    case 0xff1b: inject_key(KEY_ESC, 0); break;
+    case 0xff50: inject_key(KEY_HOME, 0); break;
+    case 0xff51: inject_key(KEY_LEFT, 0); break;
+    case 0xff52: inject_key(KEY_UP, 0); break;
+    case 0xff53: inject_key(KEY_RIGHT, 0); break;
+    case 0xff54: inject_key(KEY_DOWN, 0); break;
+    case 0xff57: inject_key(KEY_END, 0); break;
+    case 0xffff: inject_key(KEY_DELETE, 0); break;
+    default:
+        log_msg("keysym %#x not mapped", sym);
+        return;
+    }
+    log_msg("keysym %#x", sym);
 }
 
 static void text_enter(void *data, struct text_model *model, struct wl_surface *surface)
@@ -1237,11 +1350,18 @@ static void text_leave(void *data, struct text_model *model)
     keyboard_up = 0;
 }
 
+/* Where the webOS keyboard sits on screen, in the remote's 1920x1080 grid;
+ * zero size until the keyboard reports it. */
+static int32_t panel_x, panel_y, panel_w, panel_h;
+
 static void text_panel_state(void *data, struct text_model *model, uint32_t state)
 {
     (void)data;
     (void)model;
     log_msg("keyboard panel %u", state);
+    /* Closed by its own button, not by us. */
+    if (state == 0)
+        keyboard_up = 0;
 }
 
 static void text_panel_rect(void *data, struct text_model *model, int32_t x, int32_t y,
@@ -1249,10 +1369,24 @@ static void text_panel_rect(void *data, struct text_model *model, int32_t x, int
 {
     (void)data;
     (void)model;
-    (void)x;
-    (void)y;
-    (void)width;
-    (void)height;
+    panel_x = x;
+    panel_y = y;
+    panel_w = (int32_t)width;
+    panel_h = (int32_t)height;
+    log_msg("keyboard panel at %d,%d %ux%u", x, y, width, height);
+}
+
+/* True if a remote position (1920x1080 grid) is on the open keyboard. Clicks
+ * there go to the keyboard: the compositor routes them to its surface, not
+ * ours, so they must not be injected into Firefox as well. Before the
+ * keyboard reports its area, assume it covers the bottom 45%. */
+static int on_keyboard(int32_t x, int32_t y)
+{
+    if (!keyboard_up)
+        return 0;
+    if (panel_w > 0 && panel_h > 0)
+        return x >= panel_x && x < panel_x + panel_w && y >= panel_y && y < panel_y + panel_h;
+    return y >= 1080 * 55 / 100;
 }
 
 static const struct text_model_listener text_listener = {
@@ -1347,7 +1481,10 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     /* Address field sits under the tab strip and left of the menu button.
      * Coordinates are surface-local, so only judge them on the main window;
      * inside a menu they mean something else entirely. */
-    if (state == WL_POINTER_BUTTON_STATE_PRESSED && saw_motion &&
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+        note_click();
+    /* Without text-input-v3 (GTK did not bind it), guess from the position. */
+    if (!text_input_bound && state == WL_POINTER_BUTTON_STATE_PRESSED && saw_motion &&
         (!synth_focus || synth_focus == main_surface)) {
         if (last_y >= 30 && last_y < 110 && last_x < 1700)
             show_keyboard();
@@ -1443,6 +1580,9 @@ static void apply_remote_event(struct ptr_ev ev)
     wl_fixed_t fx;
     wl_fixed_t fy;
 
+    /* The keyboard handles its own clicks; Back and the wheel still apply. */
+    if (ev.button >= 0 && on_keyboard(ev.x, ev.y))
+        return;
     /* The Magic Remote reports positions on a 1920x1080 grid. */
     ev.x = ev.x * win_w / 1920;
     ev.y = ev.y * win_h / 1080;
@@ -1514,8 +1654,10 @@ static void apply_remote_event(struct ptr_ev ev)
             keys->frame(hook->data, (struct wl_pointer *)hook->proxy);
         log_msg("remote click %d at %d,%d%s", ev.down, ev.x, ev.y,
                 over ? " (in popup)" : "");
+        if (ev.down)
+            note_click();
         /* A click inside a menu must not open or close the keyboard. */
-        if (ev.down && !over) {
+        if (!text_input_bound && ev.down && !over) {
             if (ev.y >= 30 && ev.y < 110 && ev.x < 1700)
                 show_keyboard();
             else
@@ -1970,6 +2112,8 @@ void webos_xdg_listener_ready(struct wl_proxy *proxy)
         emit_toplevel_configure(v);
     if (v && v->kind == V_POPUP)
         emit_popup_configure(v);
+    if (v && v->kind == V_TEXT_INPUT)
+        text_input_enter_main();
 }
 
 static int cursor_surface_slot(struct wl_proxy *surface)
@@ -2078,6 +2222,12 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
     }
 
     if (!strcmp(name, "wl_registry") && opcode == WL_REGISTRY_BIND && interface && args) {
+        if (!strcmp(interface->name, "zwp_text_input_manager_v3")) {
+            *out = new_virt(proxy, interface, version, V_TEXT_INPUT_MANAGER, NULL);
+            text_input_bound = 1;
+            log_msg("bound virtual zwp_text_input_manager_v3");
+            return 1;
+        }
         if (!strcmp(interface->name, "xdg_wm_base")) {
             struct wl_proxy *created = new_virt(proxy, interface, version, V_WM, NULL);
             log_msg("bound virtual xdg_wm_base version %u", version);

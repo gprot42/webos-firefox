@@ -5,14 +5,15 @@
 # from the Debian armel sysroot so the GTK stack stays self-consistent.
 # Run inside ffbuild:  podman exec ffbuild bash /src/build/assemble-runtime.sh
 #   TOOLCHAIN=nc4  use the buildroot-nc4 build (build/mozconfig-nc4) and its
-#                  sysroot instead of the Debian armel one
+#                  sysroot instead of the Debian armel one; nc4-gcc for the
+#                  GCC-compiled one (build/mozconfig-nc4-gcc)
 #   OUT=<dir>      assemble somewhere other than app/firefox-runtime
 #   PACK=0         do not pack an IPK (and so do not bump the version)
 set -euo pipefail
 case "${TOOLCHAIN:-arm32}" in
-    nc4)
+    nc4|nc4-gcc)
         SR=/work/nc4/out/host/arm-webos-linux-gnueabi/sysroot
-        OBJ=/work/obj-nc4
+        OBJ=/work/obj-${TOOLCHAIN}
         LIBDIRS="$SR/lib $SR/usr/lib"
         ADAPTER=/tmp/wayland-1.22.0/build-nc4/src/libwayland-client.so.0.22.0
         ADAPTER_HINT="CROSS=nc4 build/build-adapter.sh" ;;
@@ -42,7 +43,7 @@ mkdir -p "$OUT/defaults/pref" && cp /src/app/defaults/pref/00-webos.js "$OUT/def
 
 # Image decoders for GTK. nc4's gdk-pixbuf has PNG and JPEG built in, so it
 # needs no loader modules or cache.
-if [ "${TOOLCHAIN:-arm32}" != nc4 ]; then
+case "${TOOLCHAIN:-arm32}" in nc4*) ;; *)
 # Debian's gdk-pixbuf loads PNG, JPEG and the rest as
 # plug-ins listed in loaders.cache; without them GTK aborts on its first icon
 # ("Failed to load image-missing.png: Unrecognized image file format"). The
@@ -53,7 +54,46 @@ mkdir -p "$OUT/gdk-pixbuf/loaders"
 for l in png jpeg gif ico bmp xpm; do cp -L "$PB/2.10.0/loaders/libpixbufloader-$l.so" "$OUT/gdk-pixbuf/loaders/"; done
 cp -L "$PB/gdk-pixbuf-query-loaders" "$OUT/gdk-pixbuf/"
 [ -f /src/build/gdk-pixbuf-loaders.cache ] && cp /src/build/gdk-pixbuf-loaders.cache "$OUT/gdk-pixbuf/loaders.cache"
-fi
+;; esac
+
+# GTK's Wayland input-method module, so GTK reports text-field focus to the
+# adapter over text-input-v3 and the webOS keyboard opens for fields in pages.
+# The cache holds the module's absolute path on the TV (generated there with
+# gtk-query-immodules-3.0); the launcher points GTK_IM_MODULE_FILE at it.
+case "${TOOLCHAIN:-arm32}" in
+    nc4*) IMDIR=$SR/usr/lib/gtk-3.0/3.0.0/immodules ;;
+    *) IMDIR=$SR/usr/lib/arm-linux-gnueabi/gtk-3.0/3.0.0/immodules ;;
+esac
+# libwayland-egl.so.1 is left to the TV (its Mali driver is built against
+# the TV's copy), but webOS 4 has none. Bundle a generic one where only the
+# launcher adds it to the library path, and only when the TV lacks its own.
+mkdir -p "$OUT/fallback"
+for d in $LIBDIRS; do
+    [ -e "$d/libwayland-egl.so.1" ] && { cp -L "$d/libwayland-egl.so.1" "$OUT/fallback/"; break; }
+done
+[ -f "$OUT/fallback/libwayland-egl.so.1" ] || { echo "libwayland-egl.so.1 not found in the sysroot"; exit 1; }
+# GLib/GTK runtime data, bundled so nothing depends on what the TV has:
+#  - compiled GSettings schemas: GTK aborts if one it asks for is missing
+#    (org.gtk.Settings.FileChooser when a page opens a file picker);
+#  - an empty GIO module directory, so our GLib does not load the TV's GIO
+#    plug-ins, built for another GLib (2.48 on webOS 4);
+#  - xkeyboard-config data, for the default keymap xkbcommon builds when the
+#    compositor's keymap is rejected (LG's has keycodes above 0xfff).
+# The launcher points GSETTINGS_SCHEMA_DIR, GIO_MODULE_DIR and
+# XKB_CONFIG_ROOT at these.
+case "${TOOLCHAIN:-arm32}" in
+    nc4*) COMPILE_SCHEMAS=/work/nc4/out/host/bin/glib-compile-schemas ;;
+    *) COMPILE_SCHEMAS=glib-compile-schemas ;;
+esac
+mkdir -p "$OUT/glib-schemas" "$OUT/gio-modules"
+"$COMPILE_SCHEMAS" --targetdir="$OUT/glib-schemas" "$SR/usr/share/glib-2.0/schemas"
+[ -s "$OUT/glib-schemas/gschemas.compiled" ] || { echo "schema compilation failed"; exit 1; }
+[ -d "$SR/usr/share/X11/xkb/symbols" ] || { echo "no xkeyboard-config data in the sysroot"; exit 1; }
+mkdir -p "$OUT/xkb"
+for d in compat keycodes rules symbols types; do cp -a "$SR/usr/share/X11/xkb/$d" "$OUT/xkb/"; done
+mkdir -p "$OUT/gtk-immodules"
+cp -L "$IMDIR/im-wayland.so" "$OUT/gtk-immodules/"
+cp /src/build/gtk-immodules.cache "$OUT/gtk-immodules/immodules.cache"
 
 needed() { readelf -d "$1" 2>/dev/null | awk -F'[][]' '/NEEDED/{print $2}'; }
 for pass in 1 2 3 4 5 6; do
@@ -85,9 +125,9 @@ maxglibc=$(find "$OUT" -type f -exec sh -c 'file -b "$1" | grep -q ELF && objdum
 maxcxx=$(find "$OUT" -type f -exec sh -c 'file -b "$1" | grep -q ELF && objdump -T "$1" 2>/dev/null' _ {} \; | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -1 || true)
 echo "newest glibc symbol needed: $maxglibc (TV has 2.35)"
 # The nc4 build must load on glibc 2.12, bundled libraries included.
-if [ "${TOOLCHAIN:-arm32}" = nc4 ]; then
-    bash /src/build/nc4/glibc-check.sh "$OUT"
-fi
+case "${TOOLCHAIN:-arm32}" in
+    nc4*) bash /src/build/nc4/glibc-check.sh "$OUT" ;;
+esac
 # libstdc++ is linked statically (build/mozconfig-arm32), so nothing should
 # need the TV's copy.
 echo "newest libstdc++ symbol needed: ${maxcxx:-none, libstdc++ is static}"

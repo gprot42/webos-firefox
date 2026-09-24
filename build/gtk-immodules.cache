@@ -1,0 +1,8 @@
+# GTK+ Input Method Modules file
+# Automatically generated file, do not edit
+# Created on the TV by gtk-query-immodules-3.0 (gtk+ 3.24.51, nc4 SDK)
+#
+"/media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/firefox-runtime/gtk-immodules/im-wayland.so" 
+"wayland" "Wayland" "gtk30" "/usr/share/locale" "" 
+
+

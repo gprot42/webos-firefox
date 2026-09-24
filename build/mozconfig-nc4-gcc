@@ -1,0 +1,67 @@
+# EXPERIMENTAL, DOES NOT WORK. Builds and links, but Firefox crashes about two
+# seconds after start in the Rust style engine (Servo_GetComputedKeyframeValues)
+# called from GCC-compiled C++: Rust's view of the C++ structures comes from
+# bindgen, which uses clang, and GCC evidently lays out at least one of them
+# differently on 32-bit ARM. libxul is also 14 MB larger. Use
+# build/mozconfig-nc4 (clang). Details: findings.md section 16.
+#
+# Firefox ESR 153 built entirely with the buildroot-nc4 GNU toolchain: GCC 16.2
+# compiles all C and C++ and GNU ld links, against the SDK's glibc 2.12 and
+# GTK stack (build/nc4/build-sdk.sh). The same compiler built every library
+# in the SDK, so Firefox and its bundled libraries share one toolchain.
+# Rust is still compiled by rustc (which has its own LLVM), and Firefox's
+# Rust bindings generator still reads C++ headers through libclang; neither
+# can use GCC. See build/mozconfig-nc4 for the clang-compiled variant.
+NC4=/work/nc4/out/host
+NC4_SYSROOT=$NC4/arm-webos-linux-gnueabi/sysroot
+
+ac_add_options --enable-application=browser
+ac_add_options --target=arm-linux-gnueabi
+ac_add_options --with-arch=armv7-a
+# nc4's GCC and every library in its SDK use neon-fp16 (NEON plus the
+# half-precision conversions all NEON webOS TV CPUs have). With plain neon,
+# GCC calls __extendhfsf2 for llama.cpp's fp16 code, which its libgcc lacks.
+ac_add_options --with-fpu=neon-fp16
+ac_add_options --with-float-abi=softfp
+ac_add_options --with-thumb=yes
+ac_add_options --with-sysroot=$NC4_SYSROOT
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland-only
+ac_add_options --enable-linker=bfd
+# For bindgen only (generating Rust bindings from C++ headers).
+ac_add_options --with-libclang-path=/usr/lib/llvm-19/lib
+ac_add_options --with-clang-path=/usr/bin/clang-19
+ac_add_options --without-wasm-sandboxed-libraries
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+ac_add_options --disable-tests
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --enable-optimize
+ac_add_options --enable-release
+ac_add_options --disable-webrtc
+ac_add_options --disable-accessibility
+ac_add_options --disable-printing
+ac_add_options --disable-parental-controls
+ac_add_options --disable-webspeech
+ac_add_options --disable-synth-speechd
+ac_add_options --disable-profiling
+ac_add_options --disable-geckodriver
+ac_add_options --enable-strip
+ac_add_options --enable-install-strip
+
+export CC=$NC4/bin/arm-webos-linux-gnueabi-gcc
+export CXX=$NC4/bin/arm-webos-linux-gnueabi-g++
+# Host tools (built and run during the build) use the container's own GCC.
+export HOST_CC=gcc
+export HOST_CXX=g++
+# Same link settings as build/mozconfig-nc4: static libstdc++ with hidden
+# symbols (the TV's Mali driver loads the TV's own), glibc 2.12's separate
+# librt and libdl, and nc4's polyfills for Rust's getauxval.
+export LDFLAGS="-pthread -static-libstdc++ -Wl,--exclude-libs,libstdc++.a:libsupc++.a -Wl,--push-state,--as-needed -lrt -Wl,--pop-state -lglibc_polyfills -ldl"
+export CFLAGS="-include /src/build/nc4/glibc-compat.h"
+export CXXFLAGS="-include /src/build/nc4/glibc-compat.h"
+# bindgen parses C++ headers with libclang, which does not know about the
+# SDK's GCC: point it there, or it picks the container's own cross GCC 13.
+export BINDGEN_CFLAGS="--gcc-install-dir=$NC4/lib/gcc/arm-webos-linux-gnueabi/16.2.0"
+export RUSTFLAGS="-C target-feature=-soft-float,+vfp3,+neon"
+mk_add_options MOZ_OBJDIR=/work/obj-nc4-gcc

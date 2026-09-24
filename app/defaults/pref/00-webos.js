@@ -91,3 +91,9 @@ pref("browser.sessionstore.resume_from_crash", false);
 pref("browser.startup.homepage", "about:blank");
 pref("startup.homepage_welcome_url", "");
 pref("browser.newtabpage.enabled", false);
+
+// Marionette (off unless <app dir>/marionette exists) applies "recommended"
+// test preferences: dummy add-on and blocklist servers, Safe Browsing off,
+// updates disabled. If Firefox stops without a clean shutdown they stay in
+// prefs.js, which broke the add-on search. Never apply them.
+pref("remote.prefs.recommended", false);
