@@ -105,6 +105,12 @@ static uint32_t host_input_name;
 static uint32_t host_text_name;
 static uint32_t host_seat_name;
 static uint32_t host_seat_version;
+/* Every wl_seat the compositor currently offers. webOS 4 TVs offer several
+ * and can add and remove them while Firefox runs (a new seat appeared just
+ * before a crash on clicking the address bar), so the seat the adapter binds
+ * for the webOS keyboard must follow removals. */
+#define MAX_SEATS 8
+static struct { uint32_t name, version; } seats[MAX_SEATS];
 static uint32_t host_shm_name;
 static uint32_t host_compositor_name;
 static uint32_t host_subcompositor_name;
@@ -116,9 +122,8 @@ static struct wl_webos_surface_group_compositor *group_compositor;
 static struct wl_webos_surface_group *main_group;
 static struct wl_surface *group_root;
 static int groups_made;
-/* One slot per surface shown through the group: the surface, its wl_shell
- * role (kept while the surface lives: GTK shows the same surface again, and
- * a second role request is a protocol error), and whether it is attached.
+/* One slot per surface shown through the group: the surface and whether it
+ * is attached.
  * Slot i uses layer "content<i+1>". Layers and groups are never destroyed:
  * webOS 4's versions of these interfaces have fewer requests than
  * webos-surface-group.xml, so destroy has another opcode there ("invalid
@@ -127,10 +132,26 @@ static int groups_made;
 #define MAX_LAYERED 8
 static struct {
     struct wl_proxy *surface;
-    struct wl_shell_surface *shell;
     int attached;
+    int committed;       /* has drawn: attach decisions wait for this */
+    int32_t x, y;        /* wl_subsurface.set_position */
 } layered[MAX_LAYERED];
+/* webOS 4 does not free a layer when its surface is detached (attaching to it
+ * again is a fatal "Layer already attached"), so every attach gets a new
+ * layer with a new name and z-index. */
+static int layers_made;
+/* webOS 4: wl_shell roles for surfaces shown without subsurfaces (group
+ * layers, pop-ups). A surface keeps its role while it lives, since a second
+ * get_shell_surface is a protocol error, so roles are cached here and
+ * dropped when the surface is destroyed. */
+#define MAX_SHELLED 24
+static struct {
+    struct wl_proxy *surface;
+    struct wl_shell_surface *shell;
+} shelled[MAX_SHELLED];
 static struct wl_webos_surface_group_layer *layers[MAX_LAYERED];
+/* webOS 4 pop-up overlay (see ov_redraw). */
+static struct wl_surface *ov_surface;
 #define DATA_DEVICE_MANAGER_NAME 0x7f000003
 #define SUBCOMPOSITOR_NAME 0x7f000004
 static struct wl_subcompositor *our_subcompositor;
@@ -227,6 +248,11 @@ static int emitting;
  * WEBOS_XDG_SIZE=WxH in the launcher's env file, e.g. 1920x1080. */
 static int win_w = 1280;
 static int win_h = 720;
+/* The main window's size as GTK declares it (xdg_surface.set_window_geometry).
+ * A fullscreen Firefox takes the output's size, which can differ from
+ * win_w x win_h (1920x1080 in LG's webOS 4 emulator), so pop-ups are kept
+ * inside this when known. */
+static int geo_w, geo_h;
 
 static void read_window_size(void)
 {
@@ -583,10 +609,10 @@ static void place_popup(struct virt *popup, const struct virt *pos)
     x += pos->p_ox;
     y += pos->p_oy;
     /* Stand in for constraint_adjustment: keep it on screen. */
-    if (x + w > win_w)
-        x = win_w - w;
-    if (y + h > win_h)
-        y = win_h - h;
+    if (x + w > (geo_w > 0 ? geo_w : win_w))
+        x = (geo_w > 0 ? geo_w : win_w) - w;
+    if (y + h > (geo_h > 0 ? geo_h : win_h))
+        y = (geo_h > 0 ? geo_h : win_h) - h;
     if (x < 0)
         x = 0;
     if (y < 0)
@@ -857,6 +883,48 @@ static void text_input_commit(struct virt *v)
         l->done(v->data, (struct zwp_text_input_v3 *)v->proxy, text_input_commits);
 }
 
+static int shelled_slot(struct wl_proxy *surface)
+{
+    int i;
+
+    for (i = 0; surface && i < MAX_SHELLED; i++)
+        if (shelled[i].surface == surface)
+            return i;
+    return -1;
+}
+
+static struct wl_shell_surface *shell_role(struct wl_proxy *surface)
+{
+    int i = shelled_slot(surface);
+
+    if (i >= 0)
+        return shelled[i].shell;
+    bind_named();
+    if (!surface || !g.shell)
+        return NULL;
+    for (i = 0; i < MAX_SHELLED && shelled[i].surface; i++)
+        ;
+    if (i == MAX_SHELLED) {
+        log_msg("shell role table full");
+        return NULL;
+    }
+    shelled[i].surface = surface;
+    shelled[i].shell = wl_shell_get_shell_surface(g.shell, (struct wl_surface *)surface);
+    wl_shell_surface_add_listener(shelled[i].shell, &shell_listener, NULL);
+    return shelled[i].shell;
+}
+
+static void forget_shell_role(struct wl_proxy *surface)
+{
+    int i = shelled_slot(surface);
+
+    if (i < 0)
+        return;
+    wl_shell_surface_destroy(shelled[i].shell);
+    shelled[i].surface = NULL;
+    shelled[i].shell = NULL;
+}
+
 /* A surface Firefox made a subsurface of the main window, shown instead as
  * a surface-group layer (webOS 4). Input the compositor sends to it goes to
  * the main window, which is the surface GTK knows. */
@@ -879,18 +947,33 @@ static int is_layered(struct wl_surface *surface)
 
 static struct wl_surface *input_surface(struct wl_surface *surface)
 {
+    if (ov_surface && surface == ov_surface && main_surface)
+        return main_surface;
     return is_layered(surface) && main_surface ? main_surface : surface;
 }
+
+static int ov_enabled(void);
+static int ov_is_popup(struct wl_proxy *surface);
+static void ov_child(struct wl_proxy *child, struct wl_proxy *popup);
+static int ov_child_offset(struct wl_proxy *child, int32_t x, int32_t y);
+static void ov_popup_at(struct wl_proxy *surface, int32_t x, int32_t y);
 
 static void attach_slot(int i)
 {
     char name[24];
 
-    if (!main_group || layered[i].attached)
+    if (!main_group || layered[i].attached || layers_made >= 999)
         return;
-    snprintf(name, sizeof name, "content%d", i + 1);
-    if (!layers[i])
-        layers[i] = wl_webos_surface_group_create_layer(main_group, name, i + 1);
+    /* webOS 4 only shows a group member that is a window in its own right: a
+     * bare surface stays invisible (tested in the emulator). Being in the
+     * group keeps it from taking over the screen as a card. Only surfaces
+     * that become layers get the role: a stand-alone window with content
+     * made webOS rearrange the whole screen. */
+    if (shelled_slot(layered[i].surface) < 0 && shell_role(layered[i].surface))
+        wl_shell_surface_set_toplevel(shell_role(layered[i].surface));
+    /* z stays below the pop-up overlay's 1000. */
+    snprintf(name, sizeof name, "content%d", ++layers_made);
+    layers[i] = wl_webos_surface_group_create_layer(main_group, name, layers_made);
     wl_webos_surface_group_attach(main_group, (struct wl_surface *)layered[i].surface, name);
     layered[i].attached = 1;
     log_msg("subsurface %p shown as group layer %s", (void *)layered[i].surface, name);
@@ -910,10 +993,7 @@ static void detach_slot(int i)
 static void forget_slot(int i)
 {
     detach_slot(i);
-    if (layered[i].shell)
-        wl_shell_surface_destroy(layered[i].shell);
     layered[i].surface = NULL;
-    layered[i].shell = NULL;
 }
 
 /* The main window changed: its group stays with the old window. */
@@ -938,6 +1018,12 @@ static void emulate_subsurface(struct wl_proxy *child, struct wl_proxy *parent)
     int i;
 
     tag_child_surface(child);
+    /* Firefox makes its content surface before the pop-up gets its role, so
+     * remember it whatever the parent is; it is drawn once that is a pop-up. */
+    if (child && parent && ov_enabled() && parent != (struct wl_proxy *)main_surface) {
+        ov_child(child, parent);
+        return;
+    }
     if (!child || !parent || parent != (struct wl_proxy *)main_surface) {
         log_msg("subsurface %p of %p not shown (no wl_subcompositor)", (void *)child,
                 (void *)parent);
@@ -975,17 +1061,16 @@ static void emulate_subsurface(struct wl_proxy *child, struct wl_proxy *parent)
         log_msg("too many layers: subsurface %p not shown", (void *)child);
         return;
     }
-    layered[i].surface = child;
-    /* webOS 4 only shows a group member that is a window in its own right: a
-     * bare surface stays invisible (tested in the emulator). Being in the
-     * group keeps it from taking over the screen as a card. */
-    bind_named();
-    if (!layered[i].shell && g.shell) {
-        layered[i].shell = wl_shell_get_shell_surface(g.shell, (struct wl_surface *)child);
-        wl_shell_surface_add_listener(layered[i].shell, &shell_listener, NULL);
-        wl_shell_surface_set_toplevel(layered[i].shell);
+    if (layered[i].surface != child) {
+        layered[i].surface = child;
+        layered[i].committed = 0;
+        layered[i].x = layered[i].y = 0;
     }
-    attach_slot(i);
+    /* Attached on its first commit, when GTK has placed it: GTK shows some
+     * pop-ups as subsurfaces of the main window, and those go to the pop-up
+     * overlay instead (a layer would cover the whole window). */
+    if (layered[i].committed)
+        attach_slot(i);
 }
 
 /* wl_subsurface.set_position: a layer cannot be moved, so an offset surface
@@ -994,15 +1079,45 @@ static void layered_position(struct wl_proxy *child, int32_t x, int32_t y)
 {
     int i = layered_slot(child);
 
+    if (ov_child_offset(child, x, y))
+        return;
+    if (ov_is_popup(child)) {             /* a GTK pop-up in the overlay */
+        ov_popup_at(child, x, y);
+        return;
+    }
     if (i < 0)
         return;
-    if (x || y) {
-        log_msg("subsurface %p moved to %d,%d: layers cannot be offset", (void *)child, x, y);
+    layered[i].x = x;
+    layered[i].y = y;
+    if ((x || y) && layered[i].committed) {
+        log_msg("subsurface %p moved to %d,%d: drawn as a pop-up", (void *)child, x, y);
         detach_slot(i);
-    } else {
-        attach_slot(i);
+        layered[i].surface = NULL;
+        ov_popup_at(child, x, y);
     }
 }
+
+/* First commit of a subsurface of the main window: a layer if it sits at
+ * the origin (Firefox's content), otherwise a pop-up for the overlay. */
+static void layered_commit(struct wl_proxy *surface)
+{
+    int i = layered_slot(surface);
+
+    if (i < 0 || layered[i].committed)
+        return;
+    layered[i].committed = 1;
+    if (layered[i].x || layered[i].y) {
+        int32_t x = layered[i].x, y = layered[i].y;
+
+        log_msg("subsurface %p at %d,%d: drawn as a pop-up", (void *)surface, x, y);
+        layered[i].surface = NULL;
+        ov_popup_at(surface, x, y);
+        return;
+    }
+    attach_slot(i);
+}
+
+static void ov_popup_gone(struct wl_proxy *surface);
 
 static void unlayer_surface(struct wl_proxy *child)
 {
@@ -1010,6 +1125,674 @@ static void unlayer_surface(struct wl_proxy *child)
 
     if (i >= 0)
         detach_slot(i);
+    if (ov_is_popup(child))
+        ov_popup_gone(child);
+}
+
+/* webOS 4 pop-ups. That compositor has no wl_subcompositor and shows no
+ * small window at a place the app picks: a window group stretches every
+ * member over the owner window, and POPUP and FLOATING windows are centred
+ * or pinned to a corner (read from its QML in LG's webOS TV 4.0 emulator).
+ * So the adapter draws pop-ups itself, into one transparent full-window
+ * overlay that is a group layer above the page. When a pop-up surface
+ * commits, its shared-memory buffer (webOS 4 TVs render in software) is
+ * copied to the overlay at the pop-up's place; pointer input on the overlay
+ * goes back to the pop-up under it. Used only without wl_subcompositor. */
+#define OV_POOLS 64
+#define OV_BUFS 128
+#define OV_ITEMS 32
+
+static struct ov_pool {
+    struct wl_proxy *proxy;
+    int fd;
+    void *map;
+    size_t size;
+    int refs;
+    int dead;
+} ov_pools[OV_POOLS];
+
+static struct ov_buf {
+    struct wl_proxy *proxy;
+    struct ov_pool *pool;
+    int32_t offset, w, h, stride;
+    uint32_t format;
+} ov_bufs[OV_BUFS];
+
+/* A surface drawn into the overlay: a pop-up's own surface (popup == surface)
+ * or Firefox's content surface inside it, offset by off_x/off_y. */
+static struct ov_item {
+    struct wl_proxy *surface;
+    struct wl_proxy *popup;
+    int32_t off_x, off_y;
+    struct wl_proxy *pending;      /* attached, not yet committed */
+    int has_pending;
+    struct wl_proxy *current;      /* committed */
+    uint32_t *pix;
+    int32_t w, h;
+} ov_items[OV_ITEMS];
+
+/* Where each pop-up's surface sits in the main window. */
+static struct { struct wl_proxy *surface; int32_t x, y; unsigned seq; } ov_popups[OV_ITEMS];
+static unsigned ov_seq;
+
+static pthread_mutex_t ov_mu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+static __thread int ov_inside;     /* our own requests, or re-entered marshal */
+static struct wl_compositor *ov_compositor;
+static struct wl_shm *ov_shm;
+static struct wl_webos_surface_group_layer *ov_layer;
+static int ov_shown;
+static struct wl_buffer *ov_buffer[2];
+static uint32_t *ov_mem[2];
+static int ov_free[2];
+static int ov_dirty;
+static uint32_t *ov_canvas;
+static int32_t ov_w, ov_h;
+static int ov_failed;
+/* Pointer: the pop-up GTK is told the pointer is in, while it is on the overlay. */
+static int ov_ptr_on;
+static struct wl_surface *ov_ptr_popup;
+static int32_t ov_ptr_x, ov_ptr_y;
+static uint32_t ov_ptr_serial;
+
+static int ov_enabled(void)
+{
+    return !host_subcompositor_name && host_group_name;
+}
+
+static struct ov_pool *ov_pool_find(struct wl_proxy *proxy)
+{
+    int i;
+
+    for (i = 0; proxy && i < OV_POOLS; i++)
+        if (ov_pools[i].proxy == proxy)
+            return &ov_pools[i];
+    return NULL;
+}
+
+static void ov_pool_release(struct ov_pool *p)
+{
+    if (!p->dead || p->refs > 0)
+        return;
+    if (p->map)
+        munmap(p->map, p->size);
+    if (p->fd >= 0)
+        close(p->fd);
+    memset(p, 0, sizeof *p);
+    p->fd = -1;
+}
+
+static void ov_pool_add(struct wl_proxy *proxy, int fd, int32_t size)
+{
+    int i;
+
+    if (!proxy || size <= 0)
+        return;
+    for (i = 0; i < OV_POOLS && ov_pools[i].proxy; i++)
+        ;
+    if (i == OV_POOLS)
+        return;
+    ov_pools[i].fd = dup(fd);
+    if (ov_pools[i].fd < 0)
+        return;
+    ov_pools[i].map = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, ov_pools[i].fd, 0);
+    if (ov_pools[i].map == MAP_FAILED) {
+        close(ov_pools[i].fd);
+        ov_pools[i].fd = -1;
+        ov_pools[i].map = NULL;
+        return;
+    }
+    ov_pools[i].proxy = proxy;
+    ov_pools[i].size = (size_t)size;
+    ov_pools[i].refs = 0;
+    ov_pools[i].dead = 0;
+}
+
+static void ov_pool_resize(struct wl_proxy *proxy, int32_t size)
+{
+    struct ov_pool *p = ov_pool_find(proxy);
+    void *map;
+
+    if (!p || size <= 0 || (size_t)size <= p->size)
+        return;
+    map = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, p->fd, 0);
+    if (map == MAP_FAILED)
+        return;
+    munmap(p->map, p->size);
+    p->map = map;
+    p->size = (size_t)size;
+}
+
+static void ov_pool_destroyed(struct wl_proxy *proxy)
+{
+    struct ov_pool *p = ov_pool_find(proxy);
+
+    if (!p)
+        return;
+    p->dead = 1;
+    p->proxy = (struct wl_proxy *)p;   /* the id may be reused */
+    ov_pool_release(p);
+}
+
+static void ov_buf_add(struct wl_proxy *buffer, struct wl_proxy *pool, union wl_argument *args)
+{
+    struct ov_pool *p = ov_pool_find(pool);
+    int i;
+
+    if (!buffer || !p)
+        return;
+    for (i = 0; i < OV_BUFS && ov_bufs[i].proxy; i++)
+        ;
+    if (i == OV_BUFS)
+        return;
+    ov_bufs[i].proxy = buffer;
+    ov_bufs[i].pool = p;
+    ov_bufs[i].offset = args[1].i;
+    ov_bufs[i].w = args[2].i;
+    ov_bufs[i].h = args[3].i;
+    ov_bufs[i].stride = args[4].i;
+    ov_bufs[i].format = args[5].u;
+    p->refs++;
+}
+
+static struct ov_buf *ov_buf_find(struct wl_proxy *buffer)
+{
+    int i;
+
+    for (i = 0; buffer && i < OV_BUFS; i++)
+        if (ov_bufs[i].proxy == buffer)
+            return &ov_bufs[i];
+    return NULL;
+}
+
+static void ov_buf_destroyed(struct wl_proxy *buffer)
+{
+    struct ov_buf *b = ov_buf_find(buffer);
+    int i;
+
+    if (!b)
+        return;
+    for (i = 0; i < OV_ITEMS; i++) {
+        if (ov_items[i].current == buffer)
+            ov_items[i].current = NULL;
+        if (ov_items[i].pending == buffer)
+            ov_items[i].pending = NULL;
+    }
+    b->pool->refs--;
+    ov_pool_release(b->pool);
+    memset(b, 0, sizeof *b);
+}
+
+static int ov_popup_slot(struct wl_proxy *surface)
+{
+    int i;
+
+    for (i = 0; surface && i < OV_ITEMS; i++)
+        if (ov_popups[i].surface == surface)
+            return i;
+    return -1;
+}
+
+static struct ov_item *ov_item_find(struct wl_proxy *surface)
+{
+    int i;
+
+    for (i = 0; surface && i < OV_ITEMS; i++)
+        if (ov_items[i].surface == surface)
+            return &ov_items[i];
+    return NULL;
+}
+
+static struct ov_item *ov_item_add(struct wl_proxy *surface, struct wl_proxy *popup)
+{
+    struct ov_item *it = ov_item_find(surface);
+    int i;
+
+    if (it)
+        return it;
+    for (i = 0; i < OV_ITEMS && ov_items[i].surface; i++)
+        ;
+    if (i == OV_ITEMS)
+        return NULL;
+    memset(&ov_items[i], 0, sizeof ov_items[i]);
+    ov_items[i].surface = surface;
+    ov_items[i].popup = popup;
+    return &ov_items[i];
+}
+
+static void ov_item_drop(struct ov_item *it)
+{
+    free(it->pix);
+    memset(it, 0, sizeof *it);
+}
+
+static void ov_buffer_release(void *data, struct wl_buffer *buffer);
+static const struct wl_buffer_listener ov_buffer_listener = { ov_buffer_release };
+
+static int ov_memfd(size_t size)
+{
+    int fd = -1;
+#ifdef __NR_memfd_create
+    fd = syscall(__NR_memfd_create, "webos-xdg-popups", 1u /* MFD_CLOEXEC */);
+#endif
+    if (fd < 0) {
+        char path[] = "/tmp/webos-xdg-popups-XXXXXX";
+
+        fd = mkstemp(path);
+        if (fd >= 0)
+            unlink(path);
+    }
+    if (fd >= 0 && ftruncate(fd, (off_t)size) < 0) {
+        close(fd);
+        fd = -1;
+    }
+    return fd;
+}
+
+/* The overlay: two full-window buffers, a surface with a wl_shell role (a
+ * group member needs one to be shown) and a layer high above the page. */
+static int ov_ensure(void)
+{
+    struct wl_shm_pool *pool;
+    struct wl_shell_surface *ss;
+    size_t frame;
+    char *mem;
+    int fd, i;
+
+    if (ov_surface)
+        return 1;
+    if (ov_failed || !g.registry || !main_group || !host_compositor_name || !host_shm_name)
+        return 0;
+    ov_w = geo_w > 0 ? geo_w : win_w;
+    ov_h = geo_h > 0 ? geo_h : win_h;
+    frame = (size_t)ov_w * (size_t)ov_h * 4;
+    fd = ov_memfd(frame * 2);
+    mem = fd < 0 ? MAP_FAILED : mmap(NULL, frame * 2, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ov_canvas = calloc((size_t)ov_w * (size_t)ov_h, 4);
+    if (mem == MAP_FAILED || !ov_canvas) {
+        log_msg("pop-up overlay: no memory");
+        if (fd >= 0)
+            close(fd);
+        ov_failed = 1;
+        return 0;
+    }
+    ov_compositor = wl_registry_bind(g.registry, host_compositor_name, &wl_compositor_interface,
+                                     server_compositor_version && server_compositor_version < 3
+                                         ? server_compositor_version : 3);
+    ov_shm = wl_registry_bind(g.registry, host_shm_name, &wl_shm_interface, 1);
+    pool = wl_shm_create_pool(ov_shm, fd, (int32_t)(frame * 2));
+    for (i = 0; i < 2; i++) {
+        ov_buffer[i] = wl_shm_pool_create_buffer(pool, (int32_t)(i * frame), ov_w, ov_h, ov_w * 4,
+                                                 WL_SHM_FORMAT_ARGB8888);
+        wl_buffer_add_listener(ov_buffer[i], &ov_buffer_listener, (void *)(intptr_t)i);
+        ov_mem[i] = (uint32_t *)(mem + i * frame);
+        ov_free[i] = 1;
+    }
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    ov_surface = wl_compositor_create_surface(ov_compositor);
+    tag_surface_as((struct wl_proxy *)ov_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
+    ss = shell_role((struct wl_proxy *)ov_surface);
+    if (ss)
+        wl_shell_surface_set_toplevel(ss);
+    /* Attached once and never detached (see layers_made); with no pop-up it
+     * shows a transparent frame and takes no input. */
+    ov_layer = wl_webos_surface_group_create_layer(main_group, "popups", 1000);
+    wl_webos_surface_group_attach(main_group, ov_surface, "popups");
+    ov_shown = 1;
+    log_msg("pop-up overlay %p, %dx%d", (void *)ov_surface, ov_w, ov_h);
+    return 1;
+}
+
+/* Compose every pop-up into the canvas and show it. Called with ov_mu held. */
+static void ov_blit(const struct ov_item *it, int32_t x0, int32_t y0)
+{
+    int32_t row;
+
+    for (row = 0; row < it->h; row++) {
+        int32_t y = y0 + row, x = x0, n = it->w, skip = 0;
+
+        if (y < 0 || y >= ov_h)
+            continue;
+        if (x < 0) {
+            skip = -x;
+            n -= skip;
+            x = 0;
+        }
+        if (x + n > ov_w)
+            n = ov_w - x;
+        if (n > 0)
+            memcpy(ov_canvas + (size_t)y * ov_w + x, it->pix + (size_t)row * it->w + skip,
+                   (size_t)n * 4);
+    }
+}
+
+static void ov_redraw(void)
+{
+    struct wl_region *region;
+    unsigned done = 0;
+    int i, b, shown = 0;
+
+    if (!ov_ensure())
+        return;
+    memset(ov_canvas, 0, (size_t)ov_w * (size_t)ov_h * 4);
+    region = wl_compositor_create_region(ov_compositor);
+    /* Pop-ups oldest first; within one, GTK's own surface (the window
+     * background) first and Firefox's content on top of it. */
+    for (;;) {
+        int p = -1, k, pass;
+
+        for (k = 0; k < OV_ITEMS; k++)
+            if (ov_popups[k].surface && ov_popups[k].seq > done &&
+                (p < 0 || ov_popups[k].seq < ov_popups[p].seq))
+                p = k;
+        if (p < 0)
+            break;
+        done = ov_popups[p].seq;
+        for (pass = 0; pass < 2; pass++) {
+            for (i = 0; i < OV_ITEMS; i++) {
+                struct ov_item *it = &ov_items[i];
+
+                if (!it->surface || it->popup != ov_popups[p].surface || !it->pix ||
+                    (it->surface == it->popup) != (pass == 0))
+                    continue;
+                ov_blit(it, ov_popups[p].x + it->off_x, ov_popups[p].y + it->off_y);
+                wl_region_add(region, ov_popups[p].x + it->off_x, ov_popups[p].y + it->off_y,
+                              it->w, it->h);
+                shown++;
+            }
+        }
+    }
+    wl_surface_set_input_region(ov_surface, region);
+    wl_region_destroy(region);
+    b = ov_free[0] ? 0 : ov_free[1] ? 1 : -1;
+    {
+        static int last_shown = -1;
+
+        if (shown != last_shown)
+            log_msg("pop-up overlay: %d surface(s) drawn%s", shown,
+                    b < 0 ? ", waiting for a free buffer" : "");
+        last_shown = shown;
+    }
+    if (b < 0) {
+        ov_dirty = 1;     /* redrawn when the compositor frees a buffer */
+        return;
+    }
+    ov_dirty = 0;
+    memcpy(ov_mem[b], ov_canvas, (size_t)ov_w * (size_t)ov_h * 4);
+    ov_free[b] = 0;
+    if (getenv("WEBOS_XDG_OV_DEBUG"))
+        log_msg("overlay commit buffer %d (%d drawn)", b, shown);
+    wl_surface_attach(ov_surface, ov_buffer[b], 0, 0);
+    wl_surface_damage(ov_surface, 0, 0, ov_w, ov_h);
+    wl_surface_commit(ov_surface);
+    (void)shown;
+}
+
+static void ov_update(void)
+{
+    ov_inside = 1;
+    ov_redraw();
+    ov_inside = 0;
+}
+
+static void ov_buffer_release(void *data, struct wl_buffer *buffer)
+{
+    (void)buffer;
+    if (getenv("WEBOS_XDG_OV_DEBUG"))
+        log_msg("overlay buffer %d released", (int)(intptr_t)data);
+    pthread_mutex_lock(&ov_mu);
+    ov_free[(intptr_t)data] = 1;
+    if (ov_dirty)
+        ov_update();
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* A pop-up appeared at x,y of the main window (xdg_popup without
+ * wl_subcompositor), or moved there. */
+static void ov_popup_at(struct wl_proxy *surface, int32_t x, int32_t y)
+{
+    int i;
+
+    pthread_mutex_lock(&ov_mu);
+    i = ov_popup_slot(surface);
+    if (i < 0)
+        for (i = 0; i < OV_ITEMS && ov_popups[i].surface; i++)
+            ;
+    if (i < OV_ITEMS) {
+        if (ov_popups[i].surface != surface)
+            ov_popups[i].seq = ++ov_seq;     /* newer pop-ups are drawn on top */
+        ov_popups[i].surface = surface;
+        ov_popups[i].x = x;
+        ov_popups[i].y = y;
+        ov_item_add(surface, surface);
+        ov_update();
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static void ov_popup_gone(struct wl_proxy *surface)
+{
+    int i, p;
+
+    pthread_mutex_lock(&ov_mu);
+    p = ov_popup_slot(surface);
+    if (p >= 0) {
+        for (i = 0; i < OV_ITEMS; i++)
+            if (ov_items[i].surface && ov_items[i].popup == surface)
+                ov_item_drop(&ov_items[i]);
+        ov_popups[p].surface = NULL;
+        if (ov_ptr_popup == (struct wl_surface *)surface)
+            ov_ptr_popup = NULL;
+        ov_update();
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static int ov_is_popup(struct wl_proxy *surface)
+{
+    int r;
+
+    pthread_mutex_lock(&ov_mu);
+    r = ov_popup_slot(surface) >= 0;
+    pthread_mutex_unlock(&ov_mu);
+    return r;
+}
+
+/* Firefox's content surface inside a pop-up (it was a subsurface). */
+static void ov_child(struct wl_proxy *child, struct wl_proxy *popup)
+{
+    struct ov_item *it;
+
+    pthread_mutex_lock(&ov_mu);
+    it = ov_item_add(child, popup);
+    if (it && it->popup != popup) {   /* Firefox moved it to another pop-up */
+        it->popup = popup;
+        it->off_x = it->off_y = 0;
+        ov_update();
+    }
+    pthread_mutex_unlock(&ov_mu);
+    log_msg("subsurface %p of %p kept for the pop-up overlay", (void *)child, (void *)popup);
+}
+
+static int ov_child_offset(struct wl_proxy *child, int32_t x, int32_t y)
+{
+    struct ov_item *it;
+
+    pthread_mutex_lock(&ov_mu);
+    it = ov_item_find(child);
+    if (it && it->popup != child) {
+        it->off_x = x;
+        it->off_y = y;
+        ov_update();
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return it != NULL;
+}
+
+static void ov_surface_destroyed(struct wl_proxy *surface)
+{
+    struct ov_item *it;
+
+    if (ov_is_popup(surface)) {
+        ov_popup_gone(surface);
+        return;
+    }
+    pthread_mutex_lock(&ov_mu);
+    it = ov_item_find(surface);
+    if (it) {
+        ov_item_drop(it);
+        ov_update();
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static void ov_attach(struct wl_proxy *surface, struct wl_proxy *buffer)
+{
+    struct ov_item *it;
+
+    pthread_mutex_lock(&ov_mu);
+    it = ov_item_find(surface);
+    if (it) {
+        it->pending = buffer;
+        it->has_pending = 1;
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* Copy the committed buffer: its memory can be reused once released. */
+static void ov_commit(struct wl_proxy *surface)
+{
+    struct ov_item *it;
+    struct ov_buf *b;
+    int32_t row, col;
+
+    pthread_mutex_lock(&ov_mu);
+    it = ov_item_find(surface);
+    if (!it) {
+        pthread_mutex_unlock(&ov_mu);
+        return;
+    }
+    if (it->has_pending) {
+        it->current = it->pending;
+        it->has_pending = 0;
+    }
+    b = ov_buf_find(it->current);
+    if (!it->current) {
+        free(it->pix);
+        it->pix = NULL;
+        it->w = it->h = 0;
+    } else if (b && b->pool->map && b->w > 0 && b->h > 0 && b->stride >= b->w * 4 &&
+               (b->format == WL_SHM_FORMAT_ARGB8888 || b->format == WL_SHM_FORMAT_XRGB8888) &&
+               (size_t)b->offset + (size_t)b->stride * (size_t)b->h <= b->pool->size) {
+        if (it->w != b->w || it->h != b->h) {
+            log_msg("pop-up surface %p draws %dx%d", (void *)surface, b->w, b->h);
+            free(it->pix);
+            it->pix = malloc((size_t)b->w * (size_t)b->h * 4);
+            it->w = it->pix ? b->w : 0;
+            it->h = it->pix ? b->h : 0;
+        }
+        for (row = 0; it->pix && row < b->h; row++) {
+            const uint32_t *src =
+                (const uint32_t *)((const char *)b->pool->map + b->offset + (size_t)row * b->stride);
+            uint32_t *dst = it->pix + (size_t)row * b->w;
+
+            if (b->format == WL_SHM_FORMAT_XRGB8888)
+                for (col = 0; col < b->w; col++)
+                    dst[col] = src[col] | 0xff000000u;
+            else
+                memcpy(dst, src, (size_t)b->w * 4);
+        }
+    }
+    ov_update();
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* Requests the overlay needs to see; returns 1 if it sent the request itself. */
+static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcode,
+                        const struct wl_interface *interface, uint32_t version, uint32_t flags,
+                        union wl_argument *args, struct wl_proxy **out)
+{
+    struct wl_proxy *created;
+
+    if (ov_inside || !args || !ov_enabled())
+        return 0;
+    if (!strcmp(name, "wl_shm") && opcode == WL_SHM_CREATE_POOL) {
+        int fd = args[1].h;
+        int32_t size = args[2].i;
+
+        ov_inside = 1;
+        created = wl_proxy_marshal_array_flags(proxy, opcode, interface, version, flags, args);
+        ov_inside = 0;
+        pthread_mutex_lock(&ov_mu);
+        ov_pool_add(created, fd, size);
+        pthread_mutex_unlock(&ov_mu);
+        *out = created;
+        return 1;
+    }
+    if (!strcmp(name, "wl_shm_pool")) {
+        pthread_mutex_lock(&ov_mu);
+        if (opcode == WL_SHM_POOL_CREATE_BUFFER && ov_pool_find(proxy)) {
+            ov_inside = 1;
+            created = wl_proxy_marshal_array_flags(proxy, opcode, interface, version, flags, args);
+            ov_inside = 0;
+            ov_buf_add(created, proxy, args);
+            pthread_mutex_unlock(&ov_mu);
+            *out = created;
+            return 1;
+        }
+        if (opcode == WL_SHM_POOL_RESIZE)
+            ov_pool_resize(proxy, args[0].i);
+        pthread_mutex_unlock(&ov_mu);
+        return 0;
+    }
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_ATTACH) {
+        ov_attach(proxy, (struct wl_proxy *)args[0].o);
+    } else if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_COMMIT) {
+        layered_commit(proxy);
+        ov_commit(proxy);
+    }
+    return 0;
+}
+
+/* Destructors carry no arguments, so they are handled apart. */
+static void ov_destroying(struct wl_proxy *proxy, const char *name, uint32_t opcode)
+{
+    if (ov_inside || !ov_enabled())
+        return;
+    pthread_mutex_lock(&ov_mu);
+    if (!strcmp(name, "wl_shm_pool") && opcode == WL_SHM_POOL_DESTROY)
+        ov_pool_destroyed(proxy);
+    else if (!strcmp(name, "wl_buffer") && opcode == WL_BUFFER_DESTROY)
+        ov_buf_destroyed(proxy);
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* The pop-up under x,y of the main window, and its origin. */
+static struct wl_surface *ov_hit(int32_t x, int32_t y, int32_t *ox, int32_t *oy)
+{
+    struct wl_surface *hit = NULL;
+    unsigned top = 0;
+    int i;
+
+    pthread_mutex_lock(&ov_mu);
+    for (i = 0; i < OV_ITEMS; i++) {
+        struct ov_item *it = &ov_items[i];
+        int p = it->surface ? ov_popup_slot(it->popup) : -1;
+        int32_t x0, y0;
+
+        if (p < 0 || !it->pix || ov_popups[p].seq < top)
+            continue;
+        x0 = ov_popups[p].x + it->off_x;
+        y0 = ov_popups[p].y + it->off_y;
+        if (x >= x0 && x < x0 + it->w && y >= y0 && y < y0 + it->h) {
+            hit = (struct wl_surface *)it->popup;   /* the newest pop-up is on top */
+            top = ov_popups[p].seq;
+            *ox = ov_popups[p].x;
+            *oy = ov_popups[p].y;
+        }
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return hit;
 }
 
 static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t flags,
@@ -1150,6 +1933,8 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
                                                child->popup_x, child->popup_y);
                     wl_subsurface_set_desync(child->subsurface);
                 }
+            } else if (!our_subcompositor && ov_enabled() && v->wl_surface) {
+                ov_popup_at(v->wl_surface, child->abs_x, child->abs_y);
             }
             log_msg("popup surface=%p sub=%p at %d,%d %dx%d parent=%p",
                     (void *)child->wl_surface,
@@ -1158,12 +1943,26 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
         }
         return created;
     }
+    if (v->kind == V_SURFACE && opcode == XDG_SURFACE_SET_WINDOW_GEOMETRY && args &&
+        v->wl_surface == (struct wl_proxy *)main_surface &&
+        (args[2].i != geo_w || args[3].i != geo_h) && args[2].i > 0 && args[3].i > 0) {
+        geo_w = args[2].i;
+        geo_h = args[3].i;
+        log_msg("main window is %dx%d", geo_w, geo_h);
+    }
     if (v->kind == V_POPUP && opcode == XDG_POPUP_REPOSITION && args) {
         struct virt *pos = virt_get((struct wl_proxy *)args[0].o);
         if (pos) {
+            int32_t old_x = v->popup_x, old_y = v->popup_y;
+
             place_popup(v, pos);
+            v->abs_x += v->popup_x - old_x;
+            v->abs_y += v->popup_y - old_y;
+            if (!v->subsurface && ov_is_popup(v->wl_surface))
+                ov_popup_at(v->wl_surface, v->abs_x, v->abs_y);
             if (v->subsurface)
                 wl_subsurface_set_position(v->subsurface, v->popup_x, v->popup_y);
+
             v->configured = 0;
             emit_popup_configure(v);
         }
@@ -1184,6 +1983,9 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
         emit_toplevel_configure(v);
     if (opcode == 0 && v->proxy) {
         struct wl_proxy *dying = v->proxy;
+
+        if (v->kind == V_POPUP && v->wl_surface)
+            ov_popup_gone(v->wl_surface);
 
         virt_teardown(v);
         /* Code generated by wayland-scanner 1.20 and later destroys in the
@@ -1263,9 +2065,21 @@ static void wrapped_global(void *data, struct wl_registry *registry, uint32_t na
         host_input_name = name;
     if (!strcmp(interface, "text_model_factory"))
         host_text_name = name;
-    if (!strcmp(interface, "wl_seat") && !host_seat_name) {
-        host_seat_name = name;
-        host_seat_version = version;
+    if (!strcmp(interface, "wl_seat")) {
+        int i, free_slot = -1;
+
+        for (i = 0; i < MAX_SEATS && seats[i].name != name; i++)
+            if (!seats[i].name && free_slot < 0)
+                free_slot = i;
+        if (i == MAX_SEATS && free_slot >= 0) {
+            seats[free_slot].name = name;
+            seats[free_slot].version = version;
+            log_msg("seat added: wl_seat v%u (name %u)", version, name);
+        }
+        if (!host_seat_name) {
+            host_seat_name = name;
+            host_seat_version = version;
+        }
     }
     if (!strcmp(interface, "wl_shm") && !host_shm_name)
         host_shm_name = name;
@@ -1325,6 +2139,31 @@ static void wrapped_remove(void *data, struct wl_registry *registry, uint32_t na
 {
     struct virt *reg = virt_get((struct wl_proxy *)registry);
     void (*user_remove)(void *, struct wl_registry *, uint32_t);
+    int i;
+
+    for (i = 0; i < MAX_SEATS; i++) {
+        if (seats[i].name != name)
+            continue;
+        seats[i].name = 0;
+        log_msg("seat removed: wl_seat (name %u)", name);
+        if (name == host_seat_name) {
+            /* Our binding of it is dead on the compositor's side: naming it
+             * in a request is a fatal "invalid object" error. Rebind to
+             * another seat the next time the keyboard is needed. */
+            if (our_seat)
+                wl_proxy_destroy((struct wl_proxy *)our_seat);
+            our_seat = NULL;
+            host_seat_name = 0;
+            for (i = 0; i < MAX_SEATS; i++)
+                if (seats[i].name) {
+                    host_seat_name = seats[i].name;
+                    host_seat_version = seats[i].version;
+                    break;
+                }
+            log_msg("keyboard seat now name %u", host_seat_name);
+        }
+        break;
+    }
 
     user_remove = (reg && reg->listener)
         ? ((void (**)(void *, struct wl_registry *, uint32_t))reg->listener)[1]
@@ -1532,6 +2371,14 @@ static void hide_keyboard(void)
     text_model_hide_input_panel(text_input);
     if (our_seat)
         text_model_deactivate(text_input, our_seat);
+    /* webOS 4 destroys the text model on deactivate (a delete_id follows), and
+     * any later request on it is a fatal "invalid object" (seen in the
+     * emulator: the second keyboard crashed Firefox). webOS 25 keeps it. So
+     * there, start a new one next time. */
+    if (!host_subcompositor_name) {
+        wl_proxy_destroy((struct wl_proxy *)text_input);
+        text_input = NULL;
+    }
     keyboard_up = 0;
     log_msg("keyboard hidden");
 }
@@ -1709,7 +2556,7 @@ static const struct text_model_listener text_listener = {
 
 static void ensure_text_model(void)
 {
-    struct text_model_factory *factory;
+    static struct text_model_factory *factory;
 
     if (!g.registry)
         return;
@@ -1721,7 +2568,8 @@ static void ensure_text_model(void)
     }
     if (text_input || !host_text_name)
         return;
-    factory = wl_registry_bind(g.registry, host_text_name, &text_model_factory_interface, 1);
+    if (!factory)
+        factory = wl_registry_bind(g.registry, host_text_name, &text_model_factory_interface, 1);
     if (!factory)
         return;
     text_input = text_model_factory_create_text_model(factory);
@@ -1736,6 +2584,26 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    /* On the pop-up overlay: GTK is told about the pop-up under the pointer. */
+    ov_ptr_on = ov_surface && surface == ov_surface;
+    if (ov_ptr_on) {
+        int32_t ox = 0, oy = 0;
+        struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
+
+        ov_ptr_serial = serial;
+        ov_ptr_popup = hit;
+        ov_ptr_x = ox;
+        ov_ptr_y = oy;
+        last_x = x >> 8;
+        last_y = y >> 8;
+        saw_motion = 1;
+        note_real_pointer();
+        log_msg("POINTER enter pop-up overlay at %d,%d: pop-up %p", last_x, last_y, (void *)hit);
+        if (hit && orig && orig->enter)
+            orig->enter(data, pointer, serial, hit, x - wl_fixed_from_int(ox),
+                        y - wl_fixed_from_int(oy));
+        return;
+    }
     surface = input_surface(surface);
     last_x = x >> 8;
     last_y = y >> 8;
@@ -1753,6 +2621,13 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    if (ov_surface && surface == ov_surface) {
+        if (ov_ptr_popup && orig && orig->leave)
+            orig->leave(data, pointer, serial, ov_ptr_popup);
+        ov_ptr_popup = NULL;
+        ov_ptr_on = 0;
+        return;
+    }
     surface = input_surface(surface);
     if (synth_focus == surface)
         synth_focus = NULL;
@@ -1771,6 +2646,25 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     last_y = y >> 8;
     saw_motion = 1;
     note_real_pointer();
+    if (ov_ptr_on) {
+        int32_t ox = 0, oy = 0;
+        struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
+
+        if (hit != ov_ptr_popup) {
+            if (ov_ptr_popup && orig && orig->leave)
+                orig->leave(data, pointer, ov_ptr_serial, ov_ptr_popup);
+            if (hit && orig && orig->enter)
+                orig->enter(data, pointer, ov_ptr_serial, hit, x - wl_fixed_from_int(ox),
+                            y - wl_fixed_from_int(oy));
+            ov_ptr_popup = hit;
+            ov_ptr_x = ox;
+            ov_ptr_y = oy;
+        }
+        if (hit && orig && orig->motion)
+            orig->motion(data, pointer, time, x - wl_fixed_from_int(ov_ptr_x),
+                         y - wl_fixed_from_int(ov_ptr_y));
+        return;
+    }
     if (orig && orig->motion)
         orig->motion(data, pointer, time, x, y);
 }
@@ -2189,7 +3083,10 @@ static int popup_is_open(void)
     int i;
 
     for (i = 0; i < MAX_VIRT; i++) {
-        if (g.virts[i].proxy && g.virts[i].kind == V_POPUP && g.virts[i].subsurface)
+        /* On webOS 4 pop-ups are drawn into the overlay instead, and showing
+         * the overlay moves the keyboard focus to it and back. */
+        if (g.virts[i].proxy && g.virts[i].kind == V_POPUP &&
+            (g.virts[i].subsurface || ov_enabled()))
             return 1;
     }
     return 0;
@@ -2530,6 +3427,12 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
          * handlers on the evdev reader thread. */
     }
 
+    if (ov_intercept(proxy, name, opcode, interface, version, flags, args, out))
+        return 1;
+    if ((opcode == WL_BUFFER_DESTROY && !strcmp(name, "wl_buffer")) ||
+        (opcode == WL_SHM_POOL_DESTROY && !strcmp(name, "wl_shm_pool")))
+        ov_destroying(proxy, name, opcode);
+
     if (!strcmp(name, "wl_registry") && opcode == WL_REGISTRY_BIND && interface && args) {
         if (args[0].u == DATA_DEVICE_MANAGER_NAME &&
             !strcmp(interface->name, "wl_data_device_manager")) {
@@ -2595,6 +3498,9 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
 
         if (slot >= 0)
             forget_slot(slot);
+        forget_shell_role(proxy);
+        if (ov_enabled())
+            ov_surface_destroyed(proxy);
         if (main_group && (struct wl_surface *)proxy == group_root)
             drop_group();
     }

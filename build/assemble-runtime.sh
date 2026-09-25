@@ -96,6 +96,11 @@ mkdir -p "$OUT/fallback"
 $SHIM_CC -O2 -Wall -fPIC -shared \
     -fvisibility=hidden -Wl,-soname,libwayland-egl.so.1 \
     -o "$OUT/fallback/libwayland-egl.so.1" /src/src/wayland-egl-shim.c -ldl
+# getrandom() for TVs whose glibc lacks it (webOS 4); the launcher preloads it
+# there, since Firefox's Rust code otherwise needs /dev/random, which webOS 4's
+# app jail does not have.
+$SHIM_CC -O2 -Wall -fPIC -shared -fvisibility=hidden \
+    -o "$OUT/fallback/libgetrandom-compat.so" /src/src/getrandom-compat.c
 # GLib/GTK runtime data, bundled so nothing depends on what the TV has:
 #  - compiled GSettings schemas: GTK aborts if one it asks for is missing
 #    (org.gtk.Settings.FileChooser when a page opens a file picker);

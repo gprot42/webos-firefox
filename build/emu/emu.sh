@@ -71,8 +71,16 @@ shot)
 click)
     # The USB tablet takes absolute positions scaled to 0..32767.
     x=$(( $2 * 32767 / 1920 )); y=$(( $3 * 32767 / 1080 ))
-    qmp_input "{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$x}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$y}}" \
-              '{"type":"btn","data":{"down":true,"button":"left"}}' \
+    # Approach from a few pixels away and let webOS catch up (its first move
+    # after a while can land on one axis only), so the target gets a real
+    # motion event (webOS 4 gives the entry event screen-scale coordinates).
+    near="{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$((x - 200))}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$((y - 200))}}"
+    move="{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$x}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$y}}"
+    qmp_input "$near"
+    sleep 0.5
+    qmp_input "$move"
+    sleep 0.5
+    qmp_input "$move" '{"type":"btn","data":{"down":true,"button":"left"}}' \
               '{"type":"btn","data":{"down":false,"button":"left"}}'
     echo "clicked $2,$3" ;;
 key)

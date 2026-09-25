@@ -785,9 +785,56 @@ asserts on a missing `wl_subcompositor` in `nsWaylandDisplay::Init`.
 arrive on the layer), typing through the hardware keyboard, and the webOS
 keyboard opening for the address bar.
 
-**Not yet:** menus and other pop-ups are invisible on webOS 4 (layers cannot
-be offset; pop-ups need another mechanism), but opening and closing them no
-longer crashes. The GPU path (Mali, `wl_mali`) cannot be tested in the
+**Crash one second in on a real webOS 4 TV (0.1.10), not in the emulator:**
+a Rust panic in `uuid::Uuid::new_v4`, because the `getrandom` crate failed.
+glibc 2.24 has no `getrandom()`, so the crate falls back to `/dev/urandom`,
+but first opens `/dev/random` to wait for the kernel's pool, and webOS 4's
+native-app jail (`/etc/jail_native.conf`: `copynod /dev/urandom` only) has
+no `/dev/random`. The emulator build carries glibc 2.36 and ran outside the
+jail. Fix (0.1.11): `src/getrandom-compat.c`, a `getrandom()` that makes the
+system call (falling back to `/dev/urandom`), which the launcher preloads
+when the TV's glibc lacks one; the crate finds it through `dlsym`.
+
+**Menus and pop-ups (0.1.13).** webOS 4's compositor shows no small window
+at a place the app picks (its QML, read in the emulator): a window group
+stretches every member over the owner window (`anchors.fill`), POPUP windows
+are centred or pinned to an edge by location hint, and FLOATING windows are
+one at a time at 0,0. So the adapter draws pop-ups itself: one transparent
+full-window overlay, a group layer above the page (z 1000), into which the
+pixels of each pop-up's shared-memory buffers are copied when it commits
+(webOS 4 TVs render in software, "WebRender (Software)"). The adapter tracks
+`wl_shm` pools and buffers for this. The overlay's input region is the
+pop-up rectangles; pointer events on it go to the pop-up under them,
+translated to its coordinates. Learned on the way:
+
+- webOS 4 does not free a layer when its surface is detached: attaching to it
+  again is a fatal "Layer already attached". Layers are never reused (new
+  name and z each time) and the overlay is never detached.
+- Showing the overlay moves the keyboard focus to it and back; GTK must not
+  see that (Firefox closes menus when its window loses focus).
+- Firefox makes a pop-up's content surface before the pop-up gets its role,
+  and GTK shows some pop-ups (tooltips, some panels) as plain subsurfaces of
+  the main window at an offset. Subsurfaces are therefore attached as layers
+  only on their first commit, when their position is known; offset ones go
+  to the overlay.
+- Each pop-up has GTK's own surface (window background) and Firefox's content
+  inside it: draw the background first, or the content is hidden.
+- A group member given a wl_shell role but not attached to the group is a
+  stand-alone window to webOS, which then rearranges the screen.
+- Pointer entry events carry screen-scale coordinates (the window is
+  1280x720, scaled to 1080p); motion events are right. Hit-testing is done
+  on motion.
+
+**Keyboard crash (0.1.14).** Opening the webOS keyboard a second time (a
+YouTube search box, the address bar) ended in a fatal "invalid object": webOS
+4 destroys a text_model when it is deactivated (a `wl_display.delete_id`
+follows the `deactivate`), and the adapter reused it. The protocol has no
+destroy request; on webOS 4 the adapter now forgets the model after
+deactivating it and makes a new one for the next keyboard. webOS 25 keeps
+the model, as before.
+
+**Not yet:** in-page `<select>` lists and other pop-ups are untested on a real
+webOS 4 TV. The GPU path (Mali, `wl_mali`) cannot be tested in the
 emulator; for TVs without `libwayland-egl.so.1` the runtime now ships
 `src/wayland-egl-shim.c`, which uses the GPU driver's own `wl_egl_window`
 functions when the driver has them (older Mali drivers do, with their own

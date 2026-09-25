@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -199,6 +200,23 @@ int main(int argc, char **argv)
     setenv("MOZ_DISABLE_GPU_SANDBOX", "1", 1);
     setenv("LD_LIBRARY_PATH", libpath, 1);
     unsetenv("LD_PRELOAD");
+    /* glibc before 2.25 (webOS 4 has 2.24) has no getrandom(). Firefox's Rust
+     * code then waits on /dev/random, which webOS 4's app jail lacks, and
+     * aborts; preload one that makes the system call (src/getrandom-compat.c). */
+    {
+        void *libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+
+        if (!libc || !dlsym(libc, "getrandom")) {
+            snprintf(marker, sizeof marker, "%s/firefox-runtime/fallback/libgetrandom-compat.so",
+                     dir);
+            if (access(marker, R_OK) == 0) {
+                setenv("LD_PRELOAD", marker, 1);
+                fprintf(stderr, "geckotv: no getrandom() in this glibc, preloading %s\n", marker);
+            }
+        }
+        if (libc)
+            dlclose(libc);
+    }
     /* Wire-level trace: touch <app dir>/wayland-debug, launch once, then
      * delete the file. libwayland prints every message to stderr, which
      * is geckotv.log. */

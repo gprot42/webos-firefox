@@ -20,7 +20,7 @@ app/smoke: src/smoke.c
 	chmod 755 $@
 
 app/geckotv: src/geckotv.c
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< -ldl
 	chmod 755 $@
 
 icons:
