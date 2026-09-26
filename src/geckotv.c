@@ -82,6 +82,13 @@ static int launch_target(const char *json, char *out, size_t n)
     return 1;
 }
 
+/* A folder the launcher's user can write in, made if missing. */
+static int usable_dir(const char *path)
+{
+    mkdir_p(path);
+    return access(path, W_OK | X_OK) == 0;
+}
+
 int main(int argc, char **argv)
 {
     char exe[PATH_MAX];
@@ -108,17 +115,38 @@ int main(int argc, char **argv)
         return 1;
     *slash = '\0';
 
+    /* The profile lives in the app folder. Installed as root (a webOS 6 TV:
+     * the folder is root's, mode 755) the app's own user can create nothing
+     * there, and Firefox then shows a black window. So fall back to the
+     * user's own home, and last to /tmp, which is lost on reboot. */
+    {
+        const char *user_home = getenv("HOME");
+
+        snprintf(home, sizeof home, "%s/profile", dir);
+        if (!usable_dir(home) && user_home && user_home[0] == '/') {
+            snprintf(home, sizeof home, "%s/.geckotv-profile", user_home);
+            if (!usable_dir(home))
+                home[0] = '\0';
+        }
+        if (!home[0] || !usable_dir(home))
+            snprintf(home, sizeof home, "/tmp/com.github.gprot42.geckotv-profile");
+        usable_dir(home);
+    }
+
     snprintf(logpath, sizeof logpath, "%s/geckotv.log", dir);
     fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        snprintf(logpath, sizeof logpath, "%s/geckotv.log", home);
+        fd = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    }
     if (fd >= 0) {
         dup2(fd, 1);
         dup2(fd, 2);
         if (fd > 2)
             close(fd);
     }
-
-    snprintf(home, sizeof home, "%s/profile", dir);
-    mkdir_p(home);
+    fprintf(stderr, "geckotv: profile %s (HOME was %s, uid %u)\n", home,
+            getenv("HOME") ? getenv("HOME") : "unset", (unsigned)getuid());
     mkdir_p("/tmp/xdg");
     if (geteuid() == 0) {
         struct stat jail;
@@ -185,8 +213,25 @@ int main(int argc, char **argv)
     }
 
     setenv("HOME", home, 1);
-    setenv("XDG_CONFIG_HOME", home, 0);
-    setenv("XDG_CACHE_HOME", home, 0);
+    /* webOS's app manager passes XDG_CACHE_HOME=/var/cache/xdg, which is
+     * root's: as the app's own user Firefox cannot make its cache there and
+     * says "Your Firefox profile cannot be loaded". Keep an inherited folder
+     * only if this user can write in it. */
+    {
+        static const char *const vars[] = { "XDG_CONFIG_HOME", "XDG_CACHE_HOME" };
+        size_t v;
+
+        for (v = 0; v < sizeof vars / sizeof vars[0]; v++) {
+            const char *cur = getenv(vars[v]);
+
+            if (!cur || !cur[0] || !usable_dir(cur)) {
+                if (cur && cur[0])
+                    fprintf(stderr, "geckotv: %s=%s is not writable, using %s\n", vars[v],
+                            cur, home);
+                setenv(vars[v], home, 1);
+            }
+        }
+    }
     setenv("XDG_RUNTIME_DIR", "/tmp/xdg", 0);
     setenv("WAYLAND_DISPLAY", "wayland-0", 0);
     setenv("XKB_CONFIG_ROOT", "/usr/share/X11/xkb", 0);

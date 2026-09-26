@@ -24,14 +24,22 @@ mkdir -p "$RT/share/mime/packages"
 cp "$SR/usr/share/mime/packages/freedesktop.org.xml" "$RT/share/mime/packages/"
 update-mime-database "$RT/share/mime"
 echo "XDG_DATA_DIRS=$DEST/firefox-runtime/share" > "$APP/env"
+# The bundled glibc comes from the launcher's own folder: sam starts it with
+# no LD_LIBRARY_PATH (run-firefox.sh sets one).
 clang-19 --target=i686-linux-gnu --sysroot="$SR" -fuse-ld=lld -O2 -Wall -std=c11 \
-    -o "$APP/geckotv" /src/src/geckotv.c -ldl
+    -Wl,-rpath,'$ORIGIN/firefox-runtime' -o "$APP/geckotv" /src/src/geckotv.c -ldl
 exes=("$APP/geckotv")
 while IFS= read -r f; do exes+=("$f"); done < <(
     find "$RT" -maxdepth 1 -type f -perm -u+x ! -name '*.so*' -exec sh -c \
         'file -b "$1" | grep -q "ELF 32-bit LSB.*executable" && echo "$1"' _ {} \;)
 python3 /src/build/emu/set-interp.py /tmp/ld32.so "${exes[@]}"
+# For installing through webOS's own installer (emu.sh install), as on a TV.
+cp /src/app/appinfo.json /src/app/icon.png /src/app/largeIcon.png "$APP/"
 chmod -R a+rX "$APP"
 tar -C /work -czf /work/emu-app.tar.gz emu-app
 ls -l /work/emu-app.tar.gz
+python3 /src/scripts/pack-ipk.py --app "$APP" --arch i586
+# The 6.0 emulator has no /usr/bin/jailer; emu.sh install adds this one.
+clang-19 --target=i686-linux-gnu --sysroot="$SR" -fuse-ld=lld -O2 -Wall \
+    -static -o /work/emu-jailer /src/build/emu/jailer-standin.c
 echo EMU_ASSEMBLE_DONE

@@ -4,6 +4,9 @@
 Each run raises the patch number in app/appinfo.json first (0.1.4 -> 0.1.5);
 pass --no-bump to repack at the current version.
 
+--app DIR --arch ARCH packs another app folder at its own version, for the
+emulator's build (build/emu/assemble-emu.sh): --app /work/emu-app --arch i586.
+
 Homebrew ares-package 2.4.0 on Node 22+ writes member dates of 1970-01-01.
 webOS 5 has rejected those packages. This packer follows the same layout
 ares-package writes for a native app.
@@ -67,7 +70,7 @@ def add_tree(tar: tarfile.TarFile, src: Path, arcname: str) -> int:
             continue
         data = path.read_bytes()
         info.size = len(data)
-        if path.name in {"geckotv.sh", "smoke", "firefox", "gtk-hello"}:
+        if path.name in {"geckotv.sh", "smoke", "firefox", "gtk-hello", "gpuprobe", "geckotv"}:
             info.mode = 0o755
         else:
             info.mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
@@ -100,18 +103,29 @@ def bump_version() -> str:
     return appinfo["version"]
 
 
+def option(name: str, default: str) -> str:
+    args = sys.argv[1:]
+    return args[args.index(name) + 1] if name in args[:-1] else default
+
+
 def main() -> None:
-    if "--no-bump" in sys.argv[1:]:
+    global APP
+    arch = option("--arch", "arm")
+    if "--app" in sys.argv[1:]:
+        APP = Path(option("--app", str(APP))).resolve()
+        print(f"packing {APP} for {arch}")
+    elif "--no-bump" in sys.argv[1:]:
         print("version not bumped (--no-bump)")
     else:
         print(f"version bumped to {bump_version()}")
     appinfo = json.loads((APP / "appinfo.json").read_text())
     app_id = appinfo["id"]
     version = appinfo["version"]
-    if not (APP / "smoke").is_file():
-        raise SystemExit("app/smoke is missing. Run make first.")
-    if not (APP / "geckotv.sh").is_file():
-        raise SystemExit("app/geckotv.sh is missing.")
+    if APP == ROOT / "app":
+        if not (APP / "smoke").is_file():
+            raise SystemExit("app/smoke is missing. Run make first.")
+        if not (APP / "geckotv.sh").is_file():
+            raise SystemExit("app/geckotv.sh is missing.")
 
     def build_data(tar: tarfile.TarFile) -> None:
         for directory in (
@@ -159,7 +173,7 @@ def main() -> None:
             f"Version: {version}",
             "Section: misc",
             "Priority: optional",
-            "Architecture: arm",
+            f"Architecture: {arch}",
             f"Installed-Size: {installed}",
             "Maintainer: N/A <nobody@example.com>",
             "Description: This is a webOS application.",
@@ -179,7 +193,7 @@ def main() -> None:
     control = gzip_tar(build_control)
     debian = b"2.0\n"
     DIST.mkdir(exist_ok=True)
-    ipk = DIST / f"{app_id}_{version}_arm.ipk"
+    ipk = DIST / f"{app_id}_{version}_{arch}.ipk"
     with ipk.open("wb") as out:
         out.write(b"!<arch>\n")
         for name, blob in (

@@ -839,3 +839,66 @@ emulator; for TVs without `libwayland-egl.so.1` the runtime now ships
 `src/wayland-egl-shim.c`, which uses the GPU driver's own `wl_egl_window`
 functions when the driver has them (older Mali drivers do, with their own
 struct) and the generic ones otherwise.
+
+## 19. webOS 6: the window is composed in the adapter ("flat mode")
+
+Reported on a 2021 NANO796PC (webOS 6.5.3): the launch screen stays grey
+for a minute or two, then the app closes. Firefox itself runs (five
+processes as the app's user); webOS never shows its window.
+
+That TV's compositor offers no `wl_subcompositor` and no
+`wl_data_device_manager`, like webOS 4, so the adapter took the webOS 4
+path: Firefox's content as a surface-group layer. webOS 6 does not draw
+those layers. In LG's 6.0 emulator (build/emu, `WEBOS=6`) the layer's item
+never gets a parent in the scene (`WebOSSurfaceGroupLayer::attach ...
+parent=0x0`); the compositor has an `Eos.SurfaceGroup` QML plugin but no
+QML uses it. On the TV the window never even became the foreground app.
+
+Flat mode (`flat_mode()` in `src/webos-xdg.c`): where the compositor has no
+`wl_subcompositor` but offers `wl_webos_foreign` (webOS 5 and later; webOS 4
+does not), the pop-up overlay surface is the window itself. It gets the
+window's roles (wl_shell toplevel, appId, full screen); GTK's window,
+Firefox's content surface and every pop-up are tagged
+`_WEBOS_WINDOW_TYPE_SUBSURFACE` (webOS 6 makes any untagged surface with
+content its fullscreen card, which took the window off the screen when a
+menu opened) and copied into it, bottom to top, blended source-over.
+`WEBOS_XDG_FLAT=0|1` overrides. Details that mattered:
+
+- Frame callbacks: no surface but the window is shown, so every surface's
+  callbacks are asked of the window, from the first one on. Firefox's
+  content surface asks before it becomes a subsurface; one callback left
+  unanswered and Firefox stops drawing (idle in poll, no menus).
+- webOS 6 ignores `set_state(fullscreen)` on a surface without content, so
+  it is sent again after the window's first frame.
+- `text_model` is version 1 everywhere, but webOS 6 orders its requests
+  differently (show_input_panel 8, hide_input_panel 9, set_enter_key_type
+  12; ours are 11, 12, 6), read from the 6.0 emulator's
+  `libwayland-webos-client`. Sent by the webOS 4 numbering they are a fatal
+  "invalid arguments" (the keyboard crashed Firefox). libwayland encodes a
+  request from the proxy's own interface, so in flat mode the text model is
+  created with a webOS 6 table; `WEBOS_XDG_TEXT_MODEL=4|6` overrides.
+
+Tested in the 6.0 emulator with `WEBOS_XDG_AS_WEBOS4=1` (the emulator's
+compositor, unlike the TV's, has `wl_subcompositor`): window, menus and
+submenus, links, the on-screen keyboard opening and closing. webOS 4 in its
+emulator is unchanged (flat mode stays off). Not yet confirmed on a webOS 6
+TV. Cost: every frame is copied once more on the CPU (1280x720).
+
+The launcher also writes its log to `profile/geckotv.log` when the app
+folder is not writable by the app's user (an app installed as root).
+
+Installed as root (Homebrew Channel, `dev/install`), the app folder is
+root's, mode 755, and webOS runs the app as its own user (6795:5000 on that
+TV). Two things then broke Firefox, both reproduced in the 6.0 emulator:
+
+- No profile folder could be made in the app folder. The launcher now falls
+  back to `$HOME/.geckotv-profile`, then `/tmp` (lost on reboot), and puts its
+  log there too; the log's first line names the choice.
+- webOS's app manager sets `XDG_CACHE_HOME=/var/cache/xdg`, which is root's.
+  The launcher kept inherited XDG folders, so Firefox could not make its
+  profile's cache and stopped at "Your Firefox profile cannot be loaded". It
+  now replaces an inherited XDG folder the user cannot write in.
+
+The emulator's app manager runs native apps as root without jailer ("jail
+off") and kills an app whose window is not up within 10 seconds ("Transition
+is timeout"), which a cold Firefox under TCG misses; see build/emu/README.md.

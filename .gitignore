@@ -7,6 +7,7 @@ app/firefox
 app/lib/
 app/smoke
 app/geckotv
+app/gpuprobe
 
 # Packages
 dist/

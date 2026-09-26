@@ -101,6 +101,21 @@ $SHIM_CC -O2 -Wall -fPIC -shared \
 # app jail does not have.
 $SHIM_CC -O2 -Wall -fPIC -shared -fvisibility=hidden \
     -o "$OUT/fallback/libgetrandom-compat.so" /src/src/getrandom-compat.c
+# gpuprobe: walks the EGL/GLES path Firefox would take, step by step, to find
+# out why a TV's GPU is unused (src/gpuprobe.c). Next to the launcher; finds
+# the runtime's libwayland-client (the adapter) through its RUNPATH.
+PROTO=$(mktemp -d)
+wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml \
+    "$PROTO/xdg-shell-client-protocol.h"
+wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml \
+    "$PROTO/xdg-shell-protocol.c"
+# Wayland 1.22's headers, matching the adapter it links against (the sysroots
+# have older ones, without wl_proxy_marshal_flags).
+WLSRC=/tmp/wayland-1.22.0
+$SHIM_CC -O2 -Wall -I"$PROTO" -I$WLSRC/src -I"$(dirname "$ADAPTER")" \
+    -o "$(dirname "$OUT")/gpuprobe" /src/src/gpuprobe.c \
+    "$PROTO/xdg-shell-protocol.c" "$ADAPTER" -Wl,-rpath,'$ORIGIN/firefox-runtime' -ldl
+rm -rf "$PROTO"
 # GLib/GTK runtime data, bundled so nothing depends on what the TV has:
 #  - compiled GSettings schemas: GTK aborts if one it asks for is missing
 #    (org.gtk.Settings.FileChooser when a page opens a file picker);

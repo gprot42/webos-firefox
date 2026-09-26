@@ -116,6 +116,8 @@ static uint32_t host_compositor_name;
 static uint32_t host_subcompositor_name;
 static uint32_t host_data_device_manager_name;
 static uint32_t host_group_name;
+/* webOS 5 and later offer wl_webos_foreign; webOS 4 does not (see flat_mode). */
+static uint32_t host_foreign_name;
 /* webOS 4 has no wl_subcompositor: Firefox's content surface is shown as a
  * layer of a webOS surface group rooted at the main window instead. */
 static struct wl_webos_surface_group_compositor *group_compositor;
@@ -752,10 +754,15 @@ static void emit_toplevel_configure(struct virt *toplevel)
     log_msg("configure serial %u", g.serial);
 }
 
+static int flat_mode(void);
+static struct wl_proxy *flat_window_for(struct wl_proxy *gtk_surface);
+static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shell_surface *ws);
+
 static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surface)
 {
     const char *appid;
     int fullscreen;
+    struct wl_proxy *target;
 
     if (!xdg_surface || xdg_surface->shell_surface)
         return;
@@ -765,7 +772,11 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
         log_msg("cannot map shell=%p surface=%p", (void *)g.shell, (void *)wl_surface);
         return;
     }
-    xdg_surface->shell_surface = wl_shell_get_shell_surface(g.shell, (struct wl_surface *)wl_surface);
+    /* In flat mode the window the compositor sees is the overlay surface. */
+    target = !mapped_one ? flat_window_for(wl_surface) : NULL;
+    if (!target)
+        target = wl_surface;
+    xdg_surface->shell_surface = wl_shell_get_shell_surface(g.shell, (struct wl_surface *)target);
     if (!xdg_surface->shell_surface) {
         log_msg("wl_shell_get_shell_surface failed");
         return;
@@ -778,7 +789,7 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
     text_input_enter_main();
     if (g.webos) {
         xdg_surface->webos_surface = wl_webos_shell_get_shell_surface(
-            g.webos, (struct wl_surface *)wl_surface);
+            g.webos, (struct wl_surface *)target);
         appid = our_app_id();
         if (xdg_surface->webos_surface) {
             wl_webos_shell_surface_set_property(xdg_surface->webos_surface, "appId", appid);
@@ -800,6 +811,8 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
     }
     log_msg("mapped shell=%p webos=%p fullscreen=%d", (void *)xdg_surface->shell_surface,
             (void *)xdg_surface->webos_surface, fullscreen);
+    if (target != wl_surface)
+        flat_window_shown(wl_surface, xdg_surface->webos_surface);
 }
 
 /* Undo what the adapter created for a virtual object and free its slot. */
@@ -1018,6 +1031,10 @@ static void emulate_subsurface(struct wl_proxy *child, struct wl_proxy *parent)
     int i;
 
     tag_child_surface(child);
+    if (child && parent && flat_mode()) {   /* copied into the flat window */
+        ov_child(child, parent);
+        return;
+    }
     /* Firefox makes its content surface before the pop-up gets its role, so
      * remember it whatever the parent is; it is drawn once that is a pop-up. */
     if (child && parent && ov_enabled() && parent != (struct wl_proxy *)main_surface) {
@@ -1194,9 +1211,29 @@ static struct wl_surface *ov_ptr_popup;
 static int32_t ov_ptr_x, ov_ptr_y;
 static uint32_t ov_ptr_serial;
 
+/* webOS 6 has no wl_subcompositor either, but its compositor does not draw
+ * surface-group layers (LG's 6.0 emulator: the layer never gets a parent in
+ * the scene; a 6.5 TV never shows the window at all). So there the overlay
+ * surface is the window itself: GTK's window, Firefox's content and pop-ups
+ * are all copied into it, and none of them is shown on its own. On unless
+ * the compositor has wl_subcompositor; WEBOS_XDG_FLAT=0 or 1 overrides. */
+static int flat_mode(void)
+{
+    static int forced = -2;
+
+    if (forced == -2) {
+        const char *e = getenv("WEBOS_XDG_FLAT");
+
+        forced = e && e[0] ? atoi(e) != 0 : -1;
+    }
+    if (host_subcompositor_name)
+        return 0;
+    return forced >= 0 ? forced : host_foreign_name != 0;
+}
+
 static int ov_enabled(void)
 {
-    return !host_subcompositor_name && host_group_name;
+    return !host_subcompositor_name && (host_group_name || flat_mode());
 }
 
 static struct ov_pool *ov_pool_find(struct wl_proxy *proxy)
@@ -1400,7 +1437,8 @@ static int ov_ensure(void)
 
     if (ov_surface)
         return 1;
-    if (ov_failed || !g.registry || !main_group || !host_compositor_name || !host_shm_name)
+    if (ov_failed || !g.registry || (!main_group && !flat_mode()) || !host_compositor_name ||
+        !host_shm_name)
         return 0;
     ov_w = geo_w > 0 ? geo_w : win_w;
     ov_h = geo_h > 0 ? geo_h : win_h;
@@ -1430,6 +1468,12 @@ static int ov_ensure(void)
     wl_shm_pool_destroy(pool);
     close(fd);
     ov_surface = wl_compositor_create_surface(ov_compositor);
+    if (flat_mode()) {
+        /* The window itself: map_toplevel gives it the window's roles. */
+        ov_shown = 1;
+        log_msg("flat window %p, %dx%d", (void *)ov_surface, ov_w, ov_h);
+        return 1;
+    }
     tag_surface_as((struct wl_proxy *)ov_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
     ss = shell_role((struct wl_proxy *)ov_surface);
     if (ss)
@@ -1460,9 +1504,28 @@ static void ov_blit(const struct ov_item *it, int32_t x0, int32_t y0)
         }
         if (x + n > ov_w)
             n = ov_w - x;
-        if (n > 0)
-            memcpy(ov_canvas + (size_t)y * ov_w + x, it->pix + (size_t)row * it->w + skip,
-                   (size_t)n * 4);
+        if (n > 0) {
+            /* Source over (wl_shm ARGB is premultiplied): a menu's shadow
+             * and rounded corners show what lies below instead of black. */
+            uint32_t *d = ov_canvas + (size_t)y * ov_w + x;
+            const uint32_t *p = it->pix + (size_t)row * it->w + skip;
+            int32_t k;
+
+            for (k = 0; k < n; k++) {
+                uint32_t sp = p[k], a = sp >> 24, ia, rb, ag;
+
+                if (a == 255) {
+                    d[k] = sp;
+                } else if (a) {
+                    ia = 255 - a;
+                    rb = (d[k] & 0x00ff00ffu) * ia;
+                    ag = ((d[k] >> 8) & 0x00ff00ffu) * ia;
+                    rb = ((rb + 0x00800080u + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
+                    ag = (ag + 0x00800080u + ((ag >> 8) & 0x00ff00ffu)) & 0xff00ff00u;
+                    d[k] = sp + (rb | ag);
+                }
+            }
+        }
     }
 }
 
@@ -1629,6 +1692,37 @@ static int ov_child_offset(struct wl_proxy *child, int32_t x, int32_t y)
     return it != NULL;
 }
 
+/* Flat mode (see flat_mode): the overlay surface for GTK's main window,
+ * which is then never shown itself. NULL outside flat mode. */
+static struct wl_proxy *flat_window_for(struct wl_proxy *gtk_surface)
+{
+    int ok;
+
+    if (!flat_mode())
+        return NULL;
+    main_surface = (struct wl_surface *)gtk_surface;
+    pthread_mutex_lock(&ov_mu);
+    ov_inside = 1;
+    ok = ov_ensure();
+    ov_inside = 0;
+    pthread_mutex_unlock(&ov_mu);
+    if (!ok)
+        return NULL;
+    tag_surface_as(gtk_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
+    return (struct wl_proxy *)ov_surface;
+}
+
+/* The flat window has its roles: GTK's window becomes its bottom picture,
+ * and the first frame maps it. webOS 6 ignores set_state on a surface
+ * without content, so full screen is asked for again now. */
+static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shell_surface *ws)
+{
+    ov_popup_at(gtk_surface, 0, 0);
+    if (ws)
+        wl_webos_shell_surface_set_state(ws, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
+    log_msg("flat window shown for %p", (void *)gtk_surface);
+}
+
 static void ov_surface_destroyed(struct wl_proxy *surface)
 {
     struct ov_item *it;
@@ -1744,6 +1838,32 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
             ov_pool_resize(proxy, args[0].i);
         pthread_mutex_unlock(&ov_mu);
         return 0;
+    }
+    /* Flat mode: no surface but the window is shown, so the compositor never
+     * answers the others' frame callbacks, and Firefox stops drawing when one
+     * is left unanswered. That includes callbacks asked for before a surface
+     * is known to be part of the window (Firefox's content surface asks
+     * before it becomes a subsurface). So every surface's callbacks go to
+     * the window, made now if need be; they are answered from its first
+     * frame on. All are on the default queue. */
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_FRAME && flat_mode() &&
+        proxy != (struct wl_proxy *)ov_surface) {
+        int redirect;
+
+        pthread_mutex_lock(&ov_mu);
+        ov_inside = 1;
+        redirect = ov_ensure();
+        ov_inside = 0;
+        pthread_mutex_unlock(&ov_mu);
+        if (redirect) {
+            ov_inside = 1;
+            created = wl_proxy_marshal_array_flags(
+                (struct wl_proxy *)ov_surface, opcode, interface,
+                wl_proxy_get_version((struct wl_proxy *)ov_surface), flags, args);
+            ov_inside = 0;
+            *out = created;
+            return 1;
+        }
     }
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_ATTACH) {
         ov_attach(proxy, (struct wl_proxy *)args[0].o);
@@ -1903,6 +2023,10 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
         struct virt *pos = args ? virt_get((struct wl_proxy *)args[2].o) : NULL;
 
         created = new_virt(v->proxy, interface, v->version, V_POPUP, &child);
+        /* webOS 6 makes any untagged surface with content its fullscreen
+         * card, which takes the flat window off the screen. */
+        if (flat_mode() && v->wl_surface)
+            tag_child_surface(v->wl_surface);
         if (child) {
             child->wl_surface = v->wl_surface;
             if (pos)
@@ -2089,6 +2213,8 @@ static void wrapped_global(void *data, struct wl_registry *registry, uint32_t na
         host_data_device_manager_name = name;
     if (!strcmp(interface, "wl_webos_surface_group_compositor") && !host_group_name)
         host_group_name = name;
+    if (!strcmp(interface, "wl_webos_foreign") && !host_foreign_name)
+        host_foreign_name = name;
     /* GTK sets up no seat until wl_data_device_manager exists; webOS 4 has
      * none, so without this GTK has no keyboard or pointer at all. */
     if (!strcmp(interface, "wl_seat") && !host_data_device_manager_name && user_global &&
@@ -2346,16 +2472,87 @@ static void focus_address_bar(void)
     log_msg("focus address bar");
 }
 
+/* text_model is version 1 everywhere, but webOS 6 orders its requests
+ * differently from text-model.xml (LG's 6.0 libwayland-webos-client):
+ * invoke_action 6, commit 7, show_input_panel 8, hide_input_panel 9,
+ * set_max_text_length 10, set_platform_data 11, set_enter_key_type 12.
+ * A request sent by the other numbering is a fatal "invalid arguments", and
+ * libwayland encodes a request from the proxy's own interface, so on webOS 6
+ * the text model is created with this table. The first six requests and all
+ * events agree. The layout goes with flat mode (webOS 6);
+ * WEBOS_XDG_TEXT_MODEL=4 or 6 overrides. */
+static const struct wl_interface *tm6_activate_types[] = { NULL, &wl_seat_interface,
+                                                           &wl_surface_interface };
+static const struct wl_interface *tm6_deactivate_types[] = { &wl_seat_interface };
+static const struct wl_interface *tm6_none[] = { NULL, NULL, NULL, NULL };
+static const struct wl_message tm6_requests[] = {
+    { "set_surrounding_text", "suu", tm6_none },
+    { "activate", "uoo", tm6_activate_types },
+    { "deactivate", "o", tm6_deactivate_types },
+    { "reset", "u", tm6_none },
+    { "set_cursor_rectangle", "iiii", tm6_none },
+    { "set_content_type", "uu", tm6_none },
+    { "invoke_action", "uu", tm6_none },
+    { "commit", "", tm6_none },
+    { "show_input_panel", "", tm6_none },
+    { "hide_input_panel", "", tm6_none },
+    { "set_max_text_length", "u", tm6_none },
+    { "set_platform_data", "s", tm6_none },
+    { "set_enter_key_type", "u", tm6_none },
+    { "set_input_panel_rect", "iiuu", tm6_none },
+    { "reset_input_panel_rect", "", tm6_none },
+};
+static int tm_six;      /* the text model uses the webOS 6 table */
+
+static int text_model_layout_six(void)
+{
+    const char *e = getenv("WEBOS_XDG_TEXT_MODEL");
+
+    return e && e[0] ? atoi(e) == 6 : flat_mode();
+}
+
+static struct text_model *create_text_model(struct text_model_factory *factory)
+{
+    static struct wl_interface tm6;
+
+    tm_six = text_model_layout_six();
+    if (!tm_six)
+        return text_model_factory_create_text_model(factory);
+    if (!tm6.name) {
+        tm6 = text_model_interface;
+        tm6.method_count = sizeof tm6_requests / sizeof tm6_requests[0];
+        tm6.methods = tm6_requests;
+    }
+    return (struct text_model *)wl_proxy_marshal_flags(
+        (struct wl_proxy *)factory, TEXT_MODEL_FACTORY_CREATE_TEXT_MODEL, &tm6,
+        wl_proxy_get_version((struct wl_proxy *)factory), 0, NULL);
+}
+
+enum { TM_ENTER_KEY_TYPE, TM_SHOW_PANEL, TM_HIDE_PANEL };
+
+static void text_model_send(int which, uint32_t arg)
+{
+    static const uint32_t webos4[] = { 6, 11, 12 }, webos6[] = { 12, 8, 9 };
+    uint32_t opcode = (tm_six ? webos6 : webos4)[which];
+    struct wl_proxy *p = (struct wl_proxy *)text_input;
+
+    if (which == TM_ENTER_KEY_TYPE)
+        wl_proxy_marshal_flags(p, opcode, NULL, wl_proxy_get_version(p), 0, arg);
+    else
+        wl_proxy_marshal_flags(p, opcode, NULL, wl_proxy_get_version(p), 0);
+}
+
 static void show_keyboard(void)
 {
     ensure_text_model();
     if (!text_input || !our_seat || !main_surface)
         return;
     text_model_set_content_type(text_input, 0x100, 5);
-    text_model_set_enter_key_type(text_input, 3);
+    text_model_send(TM_ENTER_KEY_TYPE, 3);
     text_model_set_surrounding_text(text_input, "", 0, 0);
-    text_model_activate(text_input, ++g.serial, our_seat, main_surface);
-    text_model_show_input_panel(text_input);
+    text_model_activate(text_input, ++g.serial, our_seat,
+                        flat_mode() && ov_surface ? ov_surface : main_surface);
+    text_model_send(TM_SHOW_PANEL, 0);
     keyboard_up = 1;
     log_msg("keyboard shown");
 }
@@ -2368,7 +2565,7 @@ static void hide_keyboard(void)
 {
     if (!text_input || !keyboard_up)
         return;
-    text_model_hide_input_panel(text_input);
+    text_model_send(TM_HIDE_PANEL, 0);
     if (our_seat)
         text_model_deactivate(text_input, our_seat);
     /* webOS 4 destroys the text model on deactivate (a delete_id follows), and
@@ -2572,7 +2769,7 @@ static void ensure_text_model(void)
         factory = wl_registry_bind(g.registry, host_text_name, &text_model_factory_interface, 1);
     if (!factory)
         return;
-    text_input = text_model_factory_create_text_model(factory);
+    text_input = create_text_model(factory);
     if (text_input)
         text_model_add_listener(text_input, &text_listener, NULL);
     log_msg("text model %p", (void *)text_input);
@@ -2588,8 +2785,16 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     ov_ptr_on = ov_surface && surface == ov_surface;
     if (ov_ptr_on) {
         int32_t ox = 0, oy = 0;
-        struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
+        struct wl_surface *hit;
 
+        /* webOS 4 sometimes gives this enter on the remote's 1920x1080 grid
+         * (1488,324 for 999,220 of a 1280x720 window); a position outside the
+         * window can only be that. */
+        if (ov_w > 0 && ov_w < 1920 && ((x >> 8) >= ov_w || (y >> 8) >= ov_h)) {
+            x = (wl_fixed_t)((int64_t)x * ov_w / 1920);
+            y = (wl_fixed_t)((int64_t)y * ov_h / 1080);
+        }
+        hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
         ov_ptr_serial = serial;
         ov_ptr_popup = hit;
         ov_ptr_x = ox;
@@ -2651,6 +2856,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
         struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
 
         if (hit != ov_ptr_popup) {
+            log_msg("POINTER on pop-up %p at %d,%d", (void *)hit, last_x, last_y);
             if (ov_ptr_popup && orig && orig->leave)
                 orig->leave(data, pointer, ov_ptr_serial, ov_ptr_popup);
             if (hit && orig && orig->enter)
