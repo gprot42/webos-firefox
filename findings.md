@@ -902,3 +902,14 @@ TV). Two things then broke Firefox, both reproduced in the 6.0 emulator:
 The emulator's app manager runs native apps as root without jailer ("jail
 off") and kills an app whose window is not up within 10 seconds ("Transition
 is timeout"), which a cold Firefox under TCG misses; see build/emu/README.md.
+
+The webOS 6.5 TV's compositor never releases the flat window's buffers
+(a 30 s trace: 0 `wl_buffer.release`). The flat window waited for a free
+buffer after its first two (empty) frames, so it never committed again,
+Firefox's frame callbacks (answered through it) never came, and Firefox
+never drew: a black screen. The emulator's compositor releases normally,
+so `WEBOS_XDG_OV_NO_RELEASE=2` makes the adapter ignore releases to
+reproduce it (black, 2 commits, as on the TV). Now the flat window reuses
+its older buffer once it is 20 ms old when none has been released, and a
+thread retries a pending redraw every 20 ms; `WEBOS_XDG_OV_NO_RELEASE=1`
+tests that (page and menus draw).

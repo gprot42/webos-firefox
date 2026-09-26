@@ -1202,6 +1202,8 @@ static struct wl_buffer *ov_buffer[2];
 static uint32_t *ov_mem[2];
 static int ov_free[2];
 static int ov_dirty;
+/* When each overlay buffer was last committed (ms, CLOCK_MONOTONIC). */
+static long long ov_committed_at[2];
 static uint32_t *ov_canvas;
 static int32_t ov_w, ov_h;
 static int ov_failed;
@@ -1568,6 +1570,27 @@ static void ov_redraw(void)
     wl_surface_set_input_region(ov_surface, region);
     wl_region_destroy(region);
     b = ov_free[0] ? 0 : ov_free[1] ? 1 : -1;
+    /* A webOS 6.5 TV never releases the flat window's buffers (0 releases
+     * in a 30 s trace). Waiting for one deadlocks: no commit, so no frame
+     * callbacks for Firefox, so no drawing. Its compositor has what it
+     * needs by then, so reuse the older buffer once it is 20 ms old
+     * (about 50 frames a second); the worst case is a torn frame. */
+    if (b < 0 && flat_mode() && !(getenv("WEBOS_XDG_OV_NO_RELEASE") &&
+                                   !strcmp(getenv("WEBOS_XDG_OV_NO_RELEASE"), "2"))) {
+        struct timespec now;
+        long long ms;
+        int older = ov_committed_at[0] <= ov_committed_at[1] ? 0 : 1;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        ms = (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        if (ms - ov_committed_at[older] >= 20) {
+            static int told;
+
+            if (!told++)
+                log_msg("flat window: the compositor keeps its buffers; reusing them");
+            b = older;
+        }
+    }
     {
         static int last_shown = -1;
 
@@ -1583,6 +1606,12 @@ static void ov_redraw(void)
     ov_dirty = 0;
     memcpy(ov_mem[b], ov_canvas, (size_t)ov_w * (size_t)ov_h * 4);
     ov_free[b] = 0;
+    {
+        struct timespec now;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        ov_committed_at[b] = (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    }
     if (getenv("WEBOS_XDG_OV_DEBUG"))
         log_msg("overlay commit buffer %d (%d drawn)", b, shown);
     wl_surface_attach(ov_surface, ov_buffer[b], 0, 0);
@@ -1601,6 +1630,10 @@ static void ov_update(void)
 static void ov_buffer_release(void *data, struct wl_buffer *buffer)
 {
     (void)buffer;
+    /* Test switch: act like the webOS 6.5 TV, which never releases; 2 also
+     * turns off the reuse in ov_redraw (the TV's black screen). */
+    if (getenv("WEBOS_XDG_OV_NO_RELEASE"))
+        return;
     if (getenv("WEBOS_XDG_OV_DEBUG"))
         log_msg("overlay buffer %d released", (int)(intptr_t)data);
     pthread_mutex_lock(&ov_mu);
@@ -1712,11 +1745,31 @@ static struct wl_proxy *flat_window_for(struct wl_proxy *gtk_surface)
     return (struct wl_proxy *)ov_surface;
 }
 
+/* A redraw waiting for a buffer is retried here: when the compositor keeps
+ * its buffers no release event comes to retry it (see ov_redraw). */
+static void *flat_window_pump(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        usleep(20 * 1000);
+        pthread_mutex_lock(&ov_mu);
+        if (ov_dirty && ov_surface)
+            ov_update();
+        pthread_mutex_unlock(&ov_mu);
+    }
+    return NULL;
+}
+
 /* The flat window has its roles: GTK's window becomes its bottom picture,
  * and the first frame maps it. webOS 6 ignores set_state on a surface
  * without content, so full screen is asked for again now. */
 static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shell_surface *ws)
 {
+    static int pumping;
+    pthread_t thread;
+
+    if (!pumping++ && pthread_create(&thread, NULL, flat_window_pump, NULL) == 0)
+        pthread_detach(thread);
     ov_popup_at(gtk_surface, 0, 0);
     if (ws)
         wl_webos_shell_surface_set_state(ws, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
