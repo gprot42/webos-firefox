@@ -34,7 +34,7 @@ while IFS= read -r f; do exes+=("$f"); done < <(
         'file -b "$1" | grep -q "ELF 32-bit LSB.*executable" && echo "$1"' _ {} \;)
 python3 /src/build/emu/set-interp.py /tmp/ld32.so "${exes[@]}"
 # For installing through webOS's own installer (emu.sh install), as on a TV.
-cp /src/app/appinfo.json /src/app/icon.png /src/app/largeIcon.png "$APP/"
+cp /src/app/appinfo.json /src/app/icon.png /src/app/largeIcon.png /src/app/diagnose.sh "$APP/"
 chmod -R a+rX "$APP"
 tar -C /work -czf /work/emu-app.tar.gz emu-app
 ls -l /work/emu-app.tar.gz

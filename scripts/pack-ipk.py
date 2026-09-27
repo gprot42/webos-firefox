@@ -70,7 +70,7 @@ def add_tree(tar: tarfile.TarFile, src: Path, arcname: str) -> int:
             continue
         data = path.read_bytes()
         info.size = len(data)
-        if path.name in {"geckotv.sh", "smoke", "firefox", "gtk-hello", "gpuprobe", "geckotv"}:
+        if path.name in {"geckotv.sh", "smoke", "firefox", "gtk-hello", "gpuprobe", "geckotv", "diagnose.sh"}:
             info.mode = 0o755
         else:
             info.mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
