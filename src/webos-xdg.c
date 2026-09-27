@@ -59,7 +59,9 @@ enum virt_kind {
     V_DATA_SOURCE,
     V_DATA_DEVICE,
     V_SUBCOMPOSITOR,
-    V_SUBSURFACE
+    V_SUBSURFACE,
+    /* A wl_callback for wl_surface.frame that the adapter answers (flat mode). */
+    V_FRAME
 };
 
 struct virt {
@@ -302,6 +304,9 @@ static ssize_t read_own_memory(void *dst, const void *src, size_t n)
  * malloc (the fault may be inside malloc). */
 static char crash_maps[192 * 1024];
 static struct { unsigned long lo, hi, pgoff; const char *name; } crash_exec[512];
+/* Each mapped file's first mapping (see crash_load_maps). */
+static struct { const char *name; unsigned long lo; } crash_base[64];
+static int crash_nbase;
 static int crash_nexec;
 static unsigned long crash_stack_hi;
 
@@ -331,16 +336,41 @@ static void crash_load_maps(unsigned long sp)
         hi = strtoul(q + 1, &q, 16);
         if (sp >= lo && sp < hi)
             crash_stack_hi = hi;
-        if (q[3] != 'x')                       /* " r-xp" */
-            continue;
         pgoff = strtoul(q + 6, &q, 16);
         slash = strrchr(q, '/');
+        /* The file's first mapping (offset 0) is where its address 0 is:
+         * offsets printed from it match nm and addr2line. A file offset
+         * does not: lld puts code 64 KB higher in memory than in the file
+         * (the firefox binary), GNU ld does not (GTK's libraries). */
+        if (pgoff == 0 && slash && crash_nbase < 64) {
+            int k;
+
+            for (k = 0; k < crash_nbase && strcmp(crash_base[k].name, slash + 1); k++)
+                ;
+            if (k == crash_nbase) {
+                crash_base[k].name = slash + 1;
+                crash_base[k].lo = lo;
+                crash_nbase++;
+            }
+        }
+        if (q[3] != 'x')                       /* " r-xp" */
+            continue;
         crash_exec[crash_nexec].lo = lo;
         crash_exec[crash_nexec].hi = hi;
         crash_exec[crash_nexec].pgoff = pgoff;
         crash_exec[crash_nexec].name = slash ? slash + 1 : "[anon]";
         crash_nexec++;
     }
+}
+
+static unsigned long crash_module_offset(int i, unsigned long a)
+{
+    int k;
+
+    for (k = 0; k < crash_nbase; k++)
+        if (!strcmp(crash_base[k].name, crash_exec[i].name) && crash_base[k].lo <= a)
+            return a - crash_base[k].lo;
+    return a - crash_exec[i].lo + crash_exec[i].pgoff;
 }
 
 static int crash_in_code(unsigned long a)
@@ -371,7 +401,7 @@ static int crash_resolve(const char *what, unsigned long a)
     for (i = 0; i < crash_nexec; i++)
         if (a >= crash_exec[i].lo && a < crash_exec[i].hi) {
             dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx %s+%#lx\n", what, a,
-                    crash_exec[i].name, a - crash_exec[i].lo + crash_exec[i].pgoff);
+                    crash_exec[i].name, crash_module_offset(i, a));
             return 1;
         }
     dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx\n", what, a);
@@ -755,6 +785,7 @@ static void emit_toplevel_configure(struct virt *toplevel)
 }
 
 static int flat_mode(void);
+static void flat_pump_start(void);
 static struct wl_proxy *flat_window_for(struct wl_proxy *gtk_surface);
 static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shell_surface *ws);
 
@@ -1204,6 +1235,29 @@ static int ov_free[2];
 static int ov_dirty;
 /* When each overlay buffer was last committed (ms, CLOCK_MONOTONIC). */
 static long long ov_committed_at[2];
+
+static long long now_ms(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* WEBOS_XDG_FLAT_TEST=1: the flat window draws a grey background and a white
+ * bar that moves with every frame (build/emu, app/diagnose.sh): grey and a
+ * moving bar mean the TV shows the window and its new frames. */
+static int ov_flat_test(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("WEBOS_XDG_FLAT_TEST");
+
+        on = e && e[0] == '1';
+    }
+    return on;
+}
 static uint32_t *ov_canvas;
 static int32_t ov_w, ov_h;
 static int ov_failed;
@@ -1539,7 +1593,18 @@ static void ov_redraw(void)
 
     if (!ov_ensure())
         return;
-    memset(ov_canvas, 0, (size_t)ov_w * (size_t)ov_h * 4);
+    if (flat_mode()) {
+        /* The window itself: opaque. A webOS 6.5 TV seems never to draw a
+         * fully transparent frame (the first ones, before Firefox has drawn)
+         * nor answer its frame callbacks, and Firefox waits for those. */
+        uint32_t bg = ov_flat_test() ? 0xff404040u : 0xff000000u;
+        size_t k, n = (size_t)ov_w * (size_t)ov_h;
+
+        for (k = 0; k < n; k++)
+            ov_canvas[k] = bg;
+    } else {
+        memset(ov_canvas, 0, (size_t)ov_w * (size_t)ov_h * 4);
+    }
     region = wl_compositor_create_region(ov_compositor);
     /* Pop-ups oldest first; within one, GTK's own surface (the window
      * background) first and Firefox's content on top of it. */
@@ -1566,6 +1631,14 @@ static void ov_redraw(void)
                 shown++;
             }
         }
+    }
+    if (flat_mode() && ov_flat_test()) {
+        static unsigned frame;
+        int32_t bx = (int32_t)((frame++ * 24u) % (unsigned)(ov_w - 96)), by = ov_h - 48, x, y;
+
+        for (y = by; y < by + 32 && y < ov_h; y++)
+            for (x = bx; x < bx + 96 && x < ov_w; x++)
+                ov_canvas[(size_t)y * ov_w + x] = 0xffffffffu;
     }
     wl_surface_set_input_region(ov_surface, region);
     wl_region_destroy(region);
@@ -1741,23 +1814,198 @@ static struct wl_proxy *flat_window_for(struct wl_proxy *gtk_surface)
     pthread_mutex_unlock(&ov_mu);
     if (!ok)
         return NULL;
+    flat_pump_start();
     tag_surface_as(gtk_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
     return (struct wl_proxy *)ov_surface;
 }
 
-/* A redraw waiting for a buffer is retried here: when the compositor keeps
- * its buffers no release event comes to retry it (see ov_redraw). */
-static void *flat_window_pump(void *unused)
+/* Flat mode: what a webOS 6.5 TV's compositor never sends back for the
+ * window, although it shows every frame committed to it (a 40 s trace: no
+ * frame callback answered, no buffer released, no output enter). GTK freezes
+ * its frame clock until a frame callback returns, and Firefox goes from its
+ * own timer to frame callbacks once its first buffer is attached, so neither
+ * painted. So in flat mode the adapter answers them itself:
+ *  - wl_surface.frame on a copied surface makes a virtual wl_callback (V_FRAME),
+ *    answered after the window's next frame, at most every 16 ms;
+ *  - a buffer committed to a copied surface is copied at once and released
+ *    to the client the same way. The compositor gets none of those surfaces'
+ *    content, so no second release can come from it.
+ * Both go out from a wl_display.sync's done, i.e. on the thread that
+ * dispatches the display, where real events arrive. */
+#define FLAT_PENDING 128
+static struct wl_proxy *flat_frames[FLAT_PENDING];     /* virtual wl_callbacks */
+static int flat_frames_n;
+static struct wl_proxy *flat_releases[FLAT_PENDING];   /* client buffers, one per attach */
+static int flat_releases_n;
+/* What the round trip in flight will answer: a handler asks for its next
+ * frame callback from inside done, and that one waits for the next round. */
+static struct wl_proxy *flat_frames_sent[FLAT_PENDING], *flat_releases_sent[FLAT_PENDING];
+static int flat_frames_sent_n, flat_releases_sent_n;
+static int flat_sync_inflight;
+static long long flat_last_answer_ms;
+static unsigned flat_frames_answered, flat_buffers_released, flat_frames_copied;
+
+/* Both with ov_mu held. */
+static void flat_pending_add(struct wl_proxy **list, int *n, struct wl_proxy *p)
 {
+    if (*n < FLAT_PENDING)
+        list[(*n)++] = p;
+    else
+        log_msg("flat window: too many pending answers, one lost");
+}
+
+static void flat_pending_forget(struct wl_proxy **list, int *n, struct wl_proxy *p)
+{
+    int i, j = 0;
+
+    for (i = 0; i < *n; i++)
+        if (list[i] != p)
+            list[j++] = list[i];
+    *n = j;
+}
+
+/* A destroyed buffer or callback, off both lists. With ov_mu held. */
+static void flat_forget(struct wl_proxy *p)
+{
+    flat_pending_forget(flat_frames, &flat_frames_n, p);
+    flat_pending_forget(flat_frames_sent, &flat_frames_sent_n, p);
+    flat_pending_forget(flat_releases, &flat_releases_n, p);
+    flat_pending_forget(flat_releases_sent, &flat_releases_sent_n, p);
+}
+
+/* On the dispatching thread. Entries are taken one at a time, not under
+ * ov_mu: a handler may destroy a buffer or callback still on the list
+ * (flat_pending_forget then drops it), and may wait for a Firefox lock
+ * held by a thread that is inside wl_surface.commit with ov_mu. */
+static void flat_sync_done(void *data, struct wl_callback *cb, uint32_t serial)
+{
+    uint32_t t;
+
+    (void)data;
+    (void)serial;
+    wl_callback_destroy(cb);
+    pthread_mutex_lock(&ov_mu);
+    flat_sync_inflight = 0;
+    flat_last_answer_ms = now_ms();
+    pthread_mutex_unlock(&ov_mu);
+    for (;;) {
+        struct wl_proxy *buffer;
+        const struct wl_buffer_listener *l;
+
+        pthread_mutex_lock(&ov_mu);
+        if (!flat_releases_sent_n) {
+            pthread_mutex_unlock(&ov_mu);
+            break;
+        }
+        buffer = flat_releases_sent[0];
+        flat_pending_forget(flat_releases_sent, &flat_releases_sent_n, buffer);
+        pthread_mutex_unlock(&ov_mu);
+        l = wl_proxy_get_listener(buffer);
+        if (l && l->release)
+            l->release(wl_proxy_get_user_data(buffer), (struct wl_buffer *)buffer);
+        flat_buffers_released++;
+    }
+    t = (uint32_t)now_ms();      /* CLOCK_MONOTONIC ms, as compositors send */
+    for (;;) {
+        struct wl_proxy *frame;
+        struct virt *v;
+        const struct wl_callback_listener *l;
+
+        pthread_mutex_lock(&ov_mu);
+        if (!flat_frames_sent_n) {
+            pthread_mutex_unlock(&ov_mu);
+            break;
+        }
+        frame = flat_frames_sent[0];
+        flat_pending_forget(flat_frames_sent, &flat_frames_sent_n, frame);
+        pthread_mutex_unlock(&ov_mu);
+        v = virt_get(frame);
+        if (!v || v->kind != V_FRAME || !v->listener)
+            continue;
+        l = v->listener;
+        if (l->done)
+            l->done(v->data, (struct wl_callback *)frame, t);
+        flat_frames_answered++;
+    }
+}
+
+static const struct wl_callback_listener flat_sync_listener = { flat_sync_done };
+
+/* With ov_mu held: start a round trip that answers what is pending. */
+static void flat_answer_maybe(void)
+{
+    struct wl_callback *cb;
+
+    if (flat_sync_inflight || (!flat_frames_n && !flat_releases_n) || !g.display)
+        return;
+    if (now_ms() - flat_last_answer_ms < 16)
+        return;
+    memcpy(flat_frames_sent, flat_frames, (size_t)flat_frames_n * sizeof *flat_frames);
+    flat_frames_sent_n = flat_frames_n;
+    flat_frames_n = 0;
+    memcpy(flat_releases_sent, flat_releases, (size_t)flat_releases_n * sizeof *flat_releases);
+    flat_releases_sent_n = flat_releases_n;
+    flat_releases_n = 0;
+    flat_sync_inflight = 1;
+    ov_inside = 1;
+    cb = wl_display_sync(g.display);
+    if (cb)
+        wl_callback_add_listener(cb, &flat_sync_listener, NULL);
+    wl_display_flush(g.display);
+    ov_inside = 0;
+    if (!cb)
+        flat_sync_inflight = 0;
+}
+
+/* Flat mode: a surface the window copies; the compositor gets none of its
+ * content. */
+static int flat_hidden(struct wl_proxy *surface)
+{
+    int r;
+
+    if (!flat_mode() || !surface || surface == (struct wl_proxy *)ov_surface)
+        return 0;
+    pthread_mutex_lock(&ov_mu);
+    r = ov_item_find(surface) != NULL;
+    pthread_mutex_unlock(&ov_mu);
+    return r;
+}
+
+/* Every 20 ms: a redraw waiting for a buffer is retried (when the compositor
+ * keeps its buffers no release event comes to retry it, see ov_redraw), and
+ * pending frame callbacks and releases are answered. */
+static void *flat_pump(void *unused)
+{
+    long long reported = 0;
+
     (void)unused;
     for (;;) {
         usleep(20 * 1000);
         pthread_mutex_lock(&ov_mu);
-        if (ov_dirty && ov_surface)
+        if ((ov_dirty || ov_flat_test()) && ov_surface)
             ov_update();
+        flat_answer_maybe();
+        if (getenv("WEBOS_XDG_OV_DEBUG") && now_ms() - reported >= 5000) {
+            reported = now_ms();
+            log_msg("flat: %u frame callbacks answered, %u buffers released, %u frames copied",
+                    flat_frames_answered, flat_buffers_released, flat_frames_copied);
+        }
         pthread_mutex_unlock(&ov_mu);
     }
     return NULL;
+}
+
+static void flat_pump_start(void)
+{
+    static int started;
+    pthread_t thread;
+
+    pthread_mutex_lock(&ov_mu);
+    if (!started && pthread_create(&thread, NULL, flat_pump, NULL) == 0) {
+        pthread_detach(thread);
+        started = 1;
+    }
+    pthread_mutex_unlock(&ov_mu);
 }
 
 /* The flat window has its roles: GTK's window becomes its bottom picture,
@@ -1765,11 +2013,7 @@ static void *flat_window_pump(void *unused)
  * without content, so full screen is asked for again now. */
 static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shell_surface *ws)
 {
-    static int pumping;
-    pthread_t thread;
-
-    if (!pumping++ && pthread_create(&thread, NULL, flat_window_pump, NULL) == 0)
-        pthread_detach(thread);
+    flat_pump_start();
     ov_popup_at(gtk_surface, 0, 0);
     if (ws)
         wl_webos_shell_surface_set_state(ws, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
@@ -1812,6 +2056,7 @@ static void ov_commit(struct wl_proxy *surface)
     struct ov_item *it;
     struct ov_buf *b;
     int32_t row, col;
+    int consumed = 0;
 
     pthread_mutex_lock(&ov_mu);
     it = ov_item_find(surface);
@@ -1822,6 +2067,7 @@ static void ov_commit(struct wl_proxy *surface)
     if (it->has_pending) {
         it->current = it->pending;
         it->has_pending = 0;
+        consumed = 1;
     }
     b = ov_buf_find(it->current);
     if (!it->current) {
@@ -1849,7 +2095,25 @@ static void ov_commit(struct wl_proxy *surface)
             else
                 memcpy(dst, src, (size_t)b->w * 4);
         }
+        flat_frames_copied++;
+    } else if (flat_mode()) {
+        static struct wl_proxy *told[8];
+        static int ntold;
+        int k;
+
+        for (k = 0; k < ntold && told[k] != surface; k++)
+            ;
+        if (k == ntold && ntold < 8) {
+            told[ntold++] = surface;
+            log_msg("flat: surface %p committed buffer %p the window cannot copy (%s)",
+                    (void *)surface, (void *)it->current,
+                    b ? "size or format" : "not a wl_shm buffer of this process");
+        }
     }
+    /* Flat mode: copied, or of no use to anyone, and the compositor never
+     * gets it, so the client gets it back. One release per attach. */
+    if (consumed && it->current && flat_mode())
+        flat_pending_add(flat_releases, &flat_releases_n, it->current);
     ov_update();
     pthread_mutex_unlock(&ov_mu);
 }
@@ -1892,37 +2156,46 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
         pthread_mutex_unlock(&ov_mu);
         return 0;
     }
-    /* Flat mode: no surface but the window is shown, so the compositor never
-     * answers the others' frame callbacks, and Firefox stops drawing when one
-     * is left unanswered. That includes callbacks asked for before a surface
-     * is known to be part of the window (Firefox's content surface asks
-     * before it becomes a subsurface). So every surface's callbacks go to
-     * the window, made now if need be; they are answered from its first
-     * frame on. All are on the default queue. */
+    /* Flat mode: the adapter answers frame callbacks itself (flat_sync_done);
+     * the copied surfaces are never shown, and a webOS 6.5 TV answers not even
+     * the window's. The window is made now if need be and a frame of it
+     * committed, so the client's picture goes out before the answer. */
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_FRAME && flat_mode() &&
         proxy != (struct wl_proxy *)ov_surface) {
-        int redirect;
-
-        pthread_mutex_lock(&ov_mu);
-        ov_inside = 1;
-        redirect = ov_ensure();
-        ov_inside = 0;
-        pthread_mutex_unlock(&ov_mu);
-        if (redirect) {
+        created = new_virt(proxy, interface ? interface : &wl_callback_interface, 1, V_FRAME,
+                           NULL);
+        if (created) {
+            pthread_mutex_lock(&ov_mu);
             ov_inside = 1;
-            created = wl_proxy_marshal_array_flags(
-                (struct wl_proxy *)ov_surface, opcode, interface,
-                wl_proxy_get_version((struct wl_proxy *)ov_surface), flags, args);
+            ov_ensure();
             ov_inside = 0;
+            ov_dirty = 1;
+            flat_pending_add(flat_frames, &flat_frames_n, created);
+            pthread_mutex_unlock(&ov_mu);
+            flat_pump_start();
             *out = created;
             return 1;
         }
     }
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_ATTACH) {
         ov_attach(proxy, (struct wl_proxy *)args[0].o);
+        if (flat_hidden(proxy)) {
+            *out = NULL;
+            return 1;
+        }
+    } else if (!strcmp(name, "wl_surface") &&
+               (opcode == WL_SURFACE_DAMAGE || opcode == WL_SURFACE_DAMAGE_BUFFER)) {
+        if (flat_hidden(proxy)) {
+            *out = NULL;
+            return 1;
+        }
     } else if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_COMMIT) {
         layered_commit(proxy);
         ov_commit(proxy);
+        if (flat_hidden(proxy)) {
+            *out = NULL;
+            return 1;
+        }
     }
     return 0;
 }
@@ -1935,8 +2208,10 @@ static void ov_destroying(struct wl_proxy *proxy, const char *name, uint32_t opc
     pthread_mutex_lock(&ov_mu);
     if (!strcmp(name, "wl_shm_pool") && opcode == WL_SHM_POOL_DESTROY)
         ov_pool_destroyed(proxy);
-    else if (!strcmp(name, "wl_buffer") && opcode == WL_BUFFER_DESTROY)
+    else if (!strcmp(name, "wl_buffer") && opcode == WL_BUFFER_DESTROY) {
+        flat_forget(proxy);
         ov_buf_destroyed(proxy);
+    }
     pthread_mutex_unlock(&ov_mu);
 }
 
@@ -2181,8 +2456,14 @@ void webos_xdg_virtual_destroyed(struct wl_proxy *proxy)
 {
     struct virt *v = virt_get(proxy);
 
-    if (v && v->proxy == proxy)
+    if (v && v->proxy == proxy) {
+        if (v->kind == V_FRAME) {
+            pthread_mutex_lock(&ov_mu);
+            flat_forget(proxy);
+            pthread_mutex_unlock(&ov_mu);
+        }
         virt_teardown(v);
+    }
     webos_xdg_destroy_virtual(proxy);
 }
 

@@ -1,0 +1,40 @@
+diff --git a/mozglue/interposers/env_interposer.cpp b/mozglue/interposers/env_interposer.cpp
+index 2b1838a96f..25f327ff79 100644
+--- a/mozglue/interposers/env_interposer.cpp
++++ b/mozglue/interposers/env_interposer.cpp
+@@ -40,20 +40,31 @@ MFBT_API char* getenv(const char* name) {
+   return result;
+ }
+ 
++// A libc may lack one of these names: secure_getenv is glibc 2.17, and
++// __secure_getenv is its old name, kept only as a compatibility symbol and
++// missing on a webOS 26 TV, where libxkbcommon's call to it (GDK's first
++// step) crashed here. The process is not setuid, so the plain lookup is the
++// same thing: use it rather than crash.
++static char* (*real_env_lookup(const char* aName))(const char*) {
++  return dlsym_wrapper<char* (*)(const char*)>(RTLD_NEXT, aName);
++}
++
+ MFBT_API char* secure_getenv(const char* name) {
+-  static const auto real_secure_getenv = GET_REAL_SYMBOL(secure_getenv);
++  static const auto real_secure_getenv = real_env_lookup("secure_getenv");
+ 
+   pthread_mutex_lock(&gEnvLock);
+-  char* result = real_secure_getenv(name);
++  char* result =
++      real_secure_getenv ? real_secure_getenv(name) : internal_getenv(name);
+   pthread_mutex_unlock(&gEnvLock);
+   return result;
+ }
+ 
+ MFBT_API char* __secure_getenv(const char* name) {
+-  static const auto real___secure_getenv = GET_REAL_SYMBOL(__secure_getenv);
++  static const auto real___secure_getenv = real_env_lookup("__secure_getenv");
+ 
+   pthread_mutex_lock(&gEnvLock);
+-  char* result = real___secure_getenv(name);
++  char* result = real___secure_getenv ? real___secure_getenv(name)
++                                      : internal_getenv(name);
+   pthread_mutex_unlock(&gEnvLock);
+   return result;
+ }

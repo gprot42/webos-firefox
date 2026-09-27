@@ -913,3 +913,73 @@ reproduce it (black, 2 commits, as on the TV). Now the flat window reuses
 its older buffer once it is 20 ms old when none has been released, and a
 thread retries a pending redraw every 20 ms; `WEBOS_XDG_OV_NO_RELEASE=1`
 tests that (page and menus draw).
+
+0.1.22 was still black on the TV, while the emulator (installed package,
+app user, no releases) worked. The TV trace had no frame callback of the
+flat window answered and Firefox never drew, so 0.1.23 also paints the flat
+window opaque (the first frames were fully transparent, which the TV seems
+not to draw) and commits within 20 ms of any frame request, so each one goes
+out even if Firefox does not commit. `app/diagnose.sh` (in the package) runs
+the browser once with logging, a protocol trace and `WEBOS_XDG_FLAT_TEST=1`
+(grey window, a white bar moving with every frame) and writes
+`/tmp/geckotv-report.txt`: one command and one file per report.
+
+0.1.23's test pattern settled it: the tester saw the white bar move, so the
+TV shows the flat window and every frame committed to it, while its
+compositor sent back nothing for it in 40 s: no frame callback answered (13
+asked), no buffer released, no output enter. GTK freezes its frame clock
+until its first frame callback returns, and Firefox goes from its own timer
+to frame callbacks once its first buffer is attached, so neither painted
+("firefox draws: 0"). The GPU probe hanging at its first swap on that TV is
+the same thing: the Mali driver waits for a frame callback too.
+
+So in flat mode the adapter answers those itself (0.1.24, `flat_sync_done`):
+`wl_surface.frame` on a copied surface makes a virtual wl_callback, and a
+buffer committed to a copied surface is released right after it is copied;
+attach, damage and commit of those surfaces no longer reach the compositor,
+so it cannot release a second time. Both answers go out from a
+`wl_display.sync` round trip (the TV answers those), so they arrive on the
+thread that dispatches the display like real events, at most every 16 ms.
+What was pending when the round trip started is answered; a callback asked
+for from inside `done` waits for the next round (answering it at once looped
+at 10,000 a second and killed Firefox in the emulator). With the emulator
+made TV-like (`WEBOS_XDG_OV_NO_RELEASE=1`, app installed and started by the
+app manager as its user) the page and the menus draw, about six callbacks a
+second when idle. `diagnose.sh` now reports the adapter's answer counts and
+per-surface attach counts, and skips the GFX noise that hid the adapter log.
+
+## 20. webOS 26: Firefox's getenv wrapper crashes on a libc without __secure_getenv
+
+A webOS 26 TV (webOS TV 11.2.0, kernel 6.12, 32-bit userland with
+ld-linux.so.3, Mali-G510 with EGL 1.5: gpuprobe renders 180 frames at
+60 fps, both display paths) showed the launch screen and closed. The crash
+was in the first second, before any buffer: signal 11 at firefox+0x4fc7a.
+
+Firefox interposes getenv() and friends (mozglue/interposers/
+env_interposer.cpp: the Firefox binary exports getenv, secure_getenv,
+__secure_getenv, setenv, ..., so every library's calls go through them
+under one lock). secure_getenv() and __secure_getenv() look the real
+function up with dlsym(RTLD_NEXT) on first use and MOZ_CRASH when it is not
+found. That TV's libc has no __secure_getenv (glibc's old name for
+secure_getenv, since 2.17 kept only as a compatibility symbol; this libc
+does not keep it). Two bundled libraries call that old name, because they
+were built against glibc 2.12 where it is the only one: libxkbcommon
+(xkb_context_new, the first thing GDK does when opening the display) and
+NSS's freebl (its first use, i.e. the first https page). So GDK's first
+step killed Firefox.
+
+Fix: build/patches/env-interposer-no-crash.patch. When the lookup finds
+nothing, the wrapper uses the plain lookup; the process is never setuid, so
+that is the same thing. build/nc4/glibc-compat.h maps secure_getenv to
+__secure_getenv for C files (NSS) and stays as it is: the wrapper now takes
+either name.
+
+Reading the crash: the adapter's crash handler printed file offsets
+(address - mapping start + mapping offset), which match nm/addr2line for
+GNU ld's libraries (GTK) but not for lld's (the firefox binary, libxul),
+whose code sits 64 KB higher in memory than in the file: firefox+0x3fc7a
+was really firefox+0x4fc7a, the "interposition failed" MOZ_CRASH, not
+jemalloc_stats_lite. It now prints the offset from the file's first mapping.
+The unstripped binaries are in /work/obj-nc4/dist/bin (the shipped nc4
+build; obj-nc4-gcc is the failed GCC experiment), and
+/work/nc4/out/build/*/ has the unstripped GTK stack.
