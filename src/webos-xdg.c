@@ -2902,14 +2902,14 @@ static void hide_keyboard(void)
     text_model_send(TM_HIDE_PANEL, 0);
     if (our_seat)
         text_model_deactivate(text_input, our_seat);
-    /* webOS 4 destroys the text model on deactivate (a delete_id follows), and
-     * any later request on it is a fatal "invalid object" (seen in the
-     * emulator: the second keyboard crashed Firefox). webOS 25 keeps it. So
-     * there, start a new one next time. */
-    if (!host_subcompositor_name) {
-        wl_proxy_destroy((struct wl_proxy *)text_input);
-        text_input = NULL;
-    }
+    /* The compositor destroys the text model on deactivate, and any later
+     * request on it is a fatal "invalid object": seen on webOS 4 (the
+     * emulator: the second keyboard crashed Firefox) and on webOS 25 (a TV:
+     * hide the keyboard, click a field, Firefox gone). So start a new one
+     * next time. Should a compositor keep it, one object per keyboard is
+     * left behind, which is harmless. */
+    wl_proxy_destroy((struct wl_proxy *)text_input);
+    text_input = NULL;
     keyboard_up = 0;
     log_msg("keyboard hidden");
 }
