@@ -2837,12 +2837,27 @@ static const struct wl_message tm6_requests[] = {
     { "reset_input_panel_rect", "", tm6_none },
 };
 static int tm_six;      /* the text model uses the webOS 6 table */
+/* Only requests 0-5 (set_surrounding_text .. set_content_type), the ones
+ * every layout numbers alike; set_enter_key_type, show_input_panel and
+ * hide_input_panel are not sent. A webOS 6.5 TV (6.5.3-47) numbers its
+ * requests like text-model.xml, not like LG's 6.0 emulator: our hide (9 in
+ * the 6.0 table) reached it as set_max_text_length without its argument, a
+ * fatal "invalid arguments" that took Firefox down whenever a text field
+ * lost focus. activate and deactivate show and hide webOS's keyboard on
+ * their own. The default in flat mode, as no layout can be told apart from
+ * the client side; WEBOS_XDG_TEXT_MODEL=4|6 sends the full table again. */
+static int tm_shared_only;
 
 static int text_model_layout_six(void)
 {
     const char *e = getenv("WEBOS_XDG_TEXT_MODEL");
 
-    return e && e[0] ? atoi(e) == 6 : flat_mode();
+    if (e && e[0]) {
+        tm_shared_only = 0;
+        return atoi(e) == 6;
+    }
+    tm_shared_only = flat_mode();
+    return flat_mode();
 }
 
 static struct text_model *create_text_model(struct text_model_factory *factory)
@@ -2869,6 +2884,9 @@ static void text_model_send(int which, uint32_t arg)
     static const uint32_t webos4[] = { 6, 11, 12 }, webos6[] = { 12, 8, 9 };
     uint32_t opcode = (tm_six ? webos6 : webos4)[which];
     struct wl_proxy *p = (struct wl_proxy *)text_input;
+
+    if (tm_shared_only)
+        return;
 
     if (which == TM_ENTER_KEY_TYPE)
         wl_proxy_marshal_flags(p, opcode, NULL, wl_proxy_get_version(p), 0, arg);

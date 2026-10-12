@@ -982,6 +982,29 @@ in a video while the toolbar and the address bar's drop-down drew; the app
 was killed for lack of memory about 3 s after the drop-down opened; and the
 tester saw flicker while scrolling the settings.
 
+**The keyboard crash (0.1.28).** On that TV Firefox closed whenever a text
+field lost focus (Wikipedia's search box, the address bar, other pages):
+`invalid arguments for text_model@NN.set_max_text_length`, then
+`webos-xdg: signal 11` (the dropped connection), after "keyboard hidden" in
+the log. The 6.5 TV numbers its text_model requests like `text-model.xml`
+(webOS 4 order), not like LG's 6.0 emulator: our hide_input_panel, opcode 9
+in the 6.0 table, is set_max_text_length there, which needs a uint. In flat
+mode the adapter now sends only requests 0-5, which every layout numbers
+alike (set_surrounding_text .. set_content_type); activate and deactivate
+show and hide the keyboard on their own. set_enter_key_type,
+show_input_panel and hide_input_panel are not sent.
+`WEBOS_XDG_TEXT_MODEL=4|6` sends the full table again. Not yet confirmed on
+the TV: that deactivate alone hides the keyboard there.
+
+**Flicker and a frozen page.** In a video the scrolled settings page showed
+single frames mixing regions from two frames: parts from the new scroll
+position, parts missing or faint. With
+`gfx.webrender.max-partial-present-rects` 0 (full frames, default 1 on GTK)
+the flicker stopped but every tab showed the first page's background and
+never updated, while the toolbar did. So the copying of Firefox's content
+surface into the flat window is at fault: with partial presents it mixes
+frames, with full presents it stops after the first. Still open.
+
 ## 20. webOS 26: Firefox's getenv wrapper crashes on a libc without __secure_getenv
 
 A webOS 26 TV (webOS TV 11.2.0, kernel 6.12, 32-bit userland with
