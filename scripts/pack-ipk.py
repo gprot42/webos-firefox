@@ -140,6 +140,16 @@ def main() -> None:
             info.mtime = int(time.time())
             tar.addfile(info)
         add_tree(tar, APP, f"usr/palm/applications/{app_id}")
+        # An empty profile folder the app's own user can write in. Installed
+        # as root (Homebrew Channel, Dev Manager) the app folder is root's,
+        # mode 755, so the launcher fell back to /tmp: bookmarks, logins and
+        # settings were lost at every restart (a webOS 6.5 TV). add_tree skips
+        # any local profile folder, so this is the only entry for it.
+        info = tarfile.TarInfo(f"usr/palm/applications/{app_id}/profile")
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o777
+        info.mtime = int(time.time())
+        tar.addfile(info)
         pkg = {
             "id": app_id,
             "version": version,

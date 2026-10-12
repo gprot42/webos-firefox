@@ -948,6 +948,40 @@ app manager as its user) the page and the menus draw, about six callbacks a
 second when idle. `diagnose.sh` now reports the adapter's answer counts and
 per-surface attach counts, and skips the GFX noise that hid the adapter log.
 
+
+**0.1.26 on that TV, and the fix (0.1.27).** The tester's TV: webOS TV Lite
+6.5.3 (`core_os_release` 6.5.3-47 "kisscurl-koli", firmware 03.53.45),
+kernel 4.4.84 (koli), glibc 2.28, Mali-G52 (r23p0). With 0.1.26 its
+compositor released the flat window's buffers (256 in about 40 s) and the
+test pattern's bar moved, so the window problems above are solved. But
+`firefox draws: 0` and `mali buffers made: 0`: Firefox chose GPU WebRender,
+and the Mali driver never produced a frame for it. The GPU probe stops at the
+same place, after a good EGL setup ("render 180 frames ... HUNG", both
+displays). LG's emulator has no GPU, so Firefox rendered in software there,
+which is why it worked in the emulator and not on the TV.
+
+With `user_pref("gfx.webrender.software", true);` in the profile's `user.js`
+Firefox loaded pages on the TV (2026-10-12, first time on webOS 6). 0.1.27
+makes that automatic: before starting Firefox, the launcher asks the
+compositor the adapter's own question (`flat_mode_compositor()`: no
+`wl_subcompositor`, and `wl_webos_foreign` or `WEBOS_XDG_FLAT=1`; the TV's
+libwayland-client is loaded with `dlopen`) and writes that line, `true` in
+flat mode and `false` elsewhere, so webOS 25 keeps GPU WebRender. It writes
+`false` rather than dropping the line because Firefox keeps a `user.js`
+value in `prefs.js`. `GECKOTV_SOFTWARE=0|1` in the `env` file overrides.
+
+That TV ran Firefox from a profile in `/tmp`: installed as root, neither the
+app folder nor the app's home is writable by the app's user, so bookmarks,
+logins and the setting above were lost at each restart. 0.1.27's package
+ships an empty `profile` folder with mode 777 so the launcher's first choice
+works. Not yet confirmed: whether webOS 6's installer keeps that mode (if not,
+the launcher falls back to `/tmp` as before).
+
+Still open on that TV with software rendering: the page area stayed dark
+in a video while the toolbar and the address bar's drop-down drew; the app
+was killed for lack of memory about 3 s after the drop-down opened; and the
+tester saw flicker while scrolling the settings.
+
 ## 20. webOS 26: Firefox's getenv wrapper crashes on a libc without __secure_getenv
 
 A webOS 26 TV (webOS TV 11.2.0, kernel 6.12, 32-bit userland with

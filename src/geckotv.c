@@ -89,6 +89,145 @@ static int usable_dir(const char *path)
     return access(path, W_OK | X_OK) == 0;
 }
 
+/* Which compositor this is, asked before Firefox starts. The TV's
+ * libwayland-client is loaded at run time, so the launcher keeps no
+ * link-time dependency on it. */
+struct compositor_probe {
+    int subcompositor;
+    int webos_foreign;
+};
+
+struct registry_listener {
+    void (*global)(void *data, void *registry, unsigned name, const char *interface,
+                   unsigned version);
+    void (*global_remove)(void *data, void *registry, unsigned name);
+};
+
+static void probe_global(void *data, void *registry, unsigned name, const char *interface,
+                         unsigned version)
+{
+    struct compositor_probe *p = data;
+
+    (void)registry;
+    (void)name;
+    (void)version;
+    if (strcmp(interface, "wl_subcompositor") == 0)
+        p->subcompositor = 1;
+    else if (strcmp(interface, "wl_webos_foreign") == 0)
+        p->webos_foreign = 1;
+}
+
+static void probe_global_remove(void *data, void *registry, unsigned name)
+{
+    (void)data;
+    (void)registry;
+    (void)name;
+}
+
+static const struct registry_listener probe_listener = {probe_global, probe_global_remove};
+
+/* 1 when the adapter will use flat mode (webos-xdg.c flat_mode(): no
+ * wl_subcompositor, and wl_webos_foreign or WEBOS_XDG_FLAT=1), 0 when it
+ * won't, -1 when the compositor couldn't be asked. */
+static int flat_mode_compositor(void)
+{
+    struct compositor_probe probe = {0, 0};
+    void *lib = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
+    void *(*display_connect)(const char *);
+    void *(*proxy_marshal_constructor)(void *, unsigned, const void *, ...);
+    int (*proxy_add_listener)(void *, void (**)(void), void *);
+    int (*display_roundtrip)(void *);
+    void (*proxy_destroy)(void *);
+    void (*display_disconnect)(void *);
+    const void *registry_interface;
+    const char *forced;
+    void *display;
+    void *registry;
+    int result = -1;
+
+    if (!lib)
+        return -1;
+    display_connect = (void *(*)(const char *))dlsym(lib, "wl_display_connect");
+    proxy_marshal_constructor =
+        (void *(*)(void *, unsigned, const void *, ...))dlsym(lib, "wl_proxy_marshal_constructor");
+    proxy_add_listener = (int (*)(void *, void (**)(void), void *))dlsym(lib, "wl_proxy_add_listener");
+    display_roundtrip = (int (*)(void *))dlsym(lib, "wl_display_roundtrip");
+    proxy_destroy = (void (*)(void *))dlsym(lib, "wl_proxy_destroy");
+    display_disconnect = (void (*)(void *))dlsym(lib, "wl_display_disconnect");
+    registry_interface = dlsym(lib, "wl_registry_interface");
+    if (display_connect && proxy_marshal_constructor && proxy_add_listener && display_roundtrip &&
+        proxy_destroy && display_disconnect && registry_interface) {
+        display = display_connect(NULL);
+        if (display) {
+            /* wl_display_get_registry (opcode 1), spelled out. */
+            registry = proxy_marshal_constructor(display, 1, registry_interface, NULL);
+            if (registry) {
+                proxy_add_listener(registry, (void (**)(void))&probe_listener, &probe);
+                if (display_roundtrip(display) >= 0) {
+                    forced = getenv("WEBOS_XDG_FLAT");
+                    if (probe.subcompositor)
+                        result = 0;
+                    else if (forced && forced[0])
+                        result = atoi(forced) != 0;
+                    else
+                        result = probe.webos_foreign;
+                }
+                proxy_destroy(registry);
+            }
+            display_disconnect(display);
+        }
+    }
+    dlclose(lib);
+    return result;
+}
+
+/* Firefox's WebRender on the GPU or in software, written to the profile's
+ * user.js, which Firefox applies at every start. In flat mode (webOS 5 and
+ * 6) the adapter composes Firefox's surfaces into one window from their
+ * shared-memory buffers, and the GPU path never gets a frame out: a webOS 6.5
+ * TV's Mali driver waits forever at the first swap (black screen; GPU probe
+ * "hangs"). Software rendering there; Firefox's default everywhere else.
+ * The line is rewritten each start, false as well as true: Firefox keeps a
+ * user.js value in prefs.js, so dropping the line would leave it set. */
+#define SOFTWARE_PREF_MARK "// geckotv: WebRender on the GPU or in software, set at each start"
+
+static void set_software_rendering(const char *profile, int on)
+{
+    char path[PATH_MAX];
+    char tmp[PATH_MAX];
+    char line[1024];
+    FILE *in;
+    FILE *out;
+    int skip_next = 0;
+
+    snprintf(path, sizeof path, "%s/user.js", profile);
+    snprintf(tmp, sizeof tmp, "%s/user.js.geckotv-new", profile);
+    out = fopen(tmp, "w");
+    if (!out)
+        return;
+    in = fopen(path, "r");
+    if (in) {
+        while (fgets(line, sizeof line, in)) {
+            if (skip_next) {
+                skip_next = 0;
+                continue;
+            }
+            if (strncmp(line, SOFTWARE_PREF_MARK, strlen(SOFTWARE_PREF_MARK)) == 0) {
+                skip_next = 1;
+                continue;
+            }
+            fputs(line, out);
+        }
+        fclose(in);
+    }
+    fprintf(out, "%s\nuser_pref(\"gfx.webrender.software\", %s);\n", SOFTWARE_PREF_MARK,
+            on ? "true" : "false");
+    if (fclose(out) == 0)
+        rename(tmp, path);
+    else
+        unlink(tmp);
+}
+
 int main(int argc, char **argv)
 {
     char exe[PATH_MAX];
@@ -293,6 +432,28 @@ int main(int argc, char **argv)
         }
     }
     setenv("APPID", "com.github.gprot42.geckotv", 0);
+
+    /* GPU or software WebRender for this compositor (set_software_rendering).
+     * GECKOTV_SOFTWARE=0|1 in <app dir>/env overrides the choice. */
+    {
+        const char *forced = getenv("GECKOTV_SOFTWARE");
+        int flat = flat_mode_compositor();
+        int software;
+
+        if (forced && forced[0])
+            software = atoi(forced) != 0;
+        else
+            software = flat == 1;
+        if (flat >= 0 || (forced && forced[0])) {
+            set_software_rendering(home, software);
+            fprintf(stderr, "geckotv: %s rendering (%s)\n", software ? "software" : "GPU",
+                    forced && forced[0] ? "GECKOTV_SOFTWARE"
+                    : flat == 1        ? "flat-mode compositor"
+                                       : "compositor has wl_subcompositor or no wl_webos_foreign");
+        } else {
+            fprintf(stderr, "geckotv: compositor not reachable before start; rendering left as is\n");
+        }
+    }
 
     /* Started by hand as root: Firefox refuses to run as root with a profile
      * owned by the app's own user and only says "Running Nightly as root". */
