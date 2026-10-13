@@ -1005,6 +1005,17 @@ never updated, while the toolbar did. So the copying of Firefox's content
 surface into the flat window is at fault: with partial presents it mixes
 frames, with full presents it stops after the first. Still open.
 
+The cause found for the flicker (0.1.29): `ov_commit` copied the surface's
+current buffer on every commit, including commits without a new attach
+(GTK and Firefox commit to ask for a frame callback or move a surface). In
+flat mode that buffer had already gone back to the client after its first
+copy (`flat_releases`), and the client may be drawing its next frame into
+it, so the window got half-drawn and stale frames while scrolling. A commit
+without a new buffer now keeps the picture copied at attach time, as
+Wayland's own rules have it. Flat mode only; webOS 4's pop-ups unchanged.
+Not yet confirmed on the TV. The frozen page with full presents may or may
+not share this cause.
+
 ## 20. webOS 26: Firefox's getenv wrapper crashes on a libc without __secure_getenv
 
 A webOS 26 TV (webOS TV 11.2.0, kernel 6.12, 32-bit userland with

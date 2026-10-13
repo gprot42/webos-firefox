@@ -2070,7 +2070,15 @@ static void ov_commit(struct wl_proxy *surface)
         consumed = 1;
     }
     b = ov_buf_find(it->current);
-    if (!it->current) {
+    if (!consumed && flat_mode()) {
+        /* No new buffer: the surface still shows the picture copied when its
+         * buffer was attached. That buffer went back to the client right
+         * after the copy (flat_releases), and the client may be drawing its
+         * next frame into it, so copying it again showed half-drawn and
+         * stale frames: the flicker while scrolling on a webOS 6.5 TV
+         * (GTK and Firefox commit without attaching to ask for a frame
+         * callback or move a surface). */
+    } else if (!it->current) {
         free(it->pix);
         it->pix = NULL;
         it->w = it->h = 0;
