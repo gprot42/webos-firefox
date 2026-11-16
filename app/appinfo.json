@@ -1,6 +1,6 @@
 {
   "id": "com.github.gprot42.geckotv",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "vendor": "webOS Homebrew",
   "type": "native",
   "main": "geckotv",

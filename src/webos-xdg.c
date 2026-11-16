@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -181,11 +182,17 @@ struct hook {
     struct wl_proxy *proxy;
     const void *listener;
     void *data;
+    /* wl_keyboard only. A leave of the main window is held back from GTK
+     * while the webOS keyboard is open and passed on when it closes. */
+    int held_leave;
+    uint32_t held_serial;
 };
 
 static struct hook pointer_hooks[MAX_HOOK];
 static struct hook keyboard_hooks[MAX_HOOK];
 static struct hook *focused_keys;
+/* GDK's wl_keyboard, the one whose key handler turns keys into typed text. */
+static struct hook *gdk_keys;
 /* The surface our synthetic pointer events are currently inside. GDK drops
  * motion and button unless the seat has a focus, and that focus only moves
  * on enter/leave, so we have to send those ourselves. */
@@ -238,6 +245,7 @@ static int wake_pending_flag;
 
 static void show_keyboard(void);
 static void hide_keyboard(void);
+static void keyboard_closed(void);
 static void text_input_enter_main(void);
 static void ensure_text_model(void);
 static void start_remote_pointer(void);
@@ -2622,6 +2630,12 @@ static void wrapped_remove(void *data, struct wl_registry *registry, uint32_t na
                 wl_proxy_destroy((struct wl_proxy *)our_seat);
             our_seat = NULL;
             host_seat_name = 0;
+            /* The text model was activated on that seat and is gone with it. */
+            if (text_input) {
+                wl_proxy_destroy((struct wl_proxy *)text_input);
+                text_input = NULL;
+            }
+            keyboard_closed();
             for (i = 0; i < MAX_SEATS; i++)
                 if (seats[i].name) {
                     host_seat_name = seats[i].name;
@@ -2751,27 +2765,36 @@ static int ascii_key(char ch, uint32_t *code, int *shift)
     }
 }
 
-static void inject_key(uint32_t code, int shift)
+/* Firefox binds a wl_keyboard of its own next to GDK's, with a key handler
+ * that does nothing, and the one entered last may be either. */
+static struct hook *typing_keys(void)
+{
+    return gdk_keys ? gdk_keys : focused_keys;
+}
+
+/* mods is the xkb depressed modifier mask. 1 is Shift and 4 is Control. */
+static void inject_key(uint32_t code, uint32_t mods)
 {
     const struct wl_keyboard_listener *keys;
+    struct hook *to = typing_keys();
     uint32_t serial;
 
-    if (!focused_keys || !focused_keys->listener)
+    if (!to || !to->listener) {
+        log_msg("key %u dropped: no keyboard to type into", code);
         return;
-    keys = focused_keys->listener;
+    }
+    keys = to->listener;
     if (!keys->key)
         return;
     serial = ++g.serial;
-    if (shift && keys->modifiers)
-        keys->modifiers(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-                        serial, 1, 0, 0, 0);
-    keys->key(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-              serial, 0, code, WL_KEYBOARD_KEY_STATE_PRESSED);
-    keys->key(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-              serial, 0, code, WL_KEYBOARD_KEY_STATE_RELEASED);
-    if (shift && keys->modifiers)
-        keys->modifiers(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-                        serial, 0, 0, 0, 0);
+    if (mods && keys->modifiers)
+        keys->modifiers(to->data, (struct wl_keyboard *)to->proxy, serial, mods, 0, 0, 0);
+    keys->key(to->data, (struct wl_keyboard *)to->proxy, serial, 0, code,
+              WL_KEYBOARD_KEY_STATE_PRESSED);
+    keys->key(to->data, (struct wl_keyboard *)to->proxy, serial, 0, code,
+              WL_KEYBOARD_KEY_STATE_RELEASED);
+    if (mods && keys->modifiers)
+        keys->modifiers(to->data, (struct wl_keyboard *)to->proxy, serial, 0, 0, 0, 0);
 }
 
 static void inject_text(const char *text)
@@ -2791,26 +2814,8 @@ static void inject_text(const char *text)
 
 static void focus_address_bar(void)
 {
-    /* Control is xkb modifier 2. L is evdev 38. This selects the URL. */
-    const struct wl_keyboard_listener *keys;
-    uint32_t serial;
-
-    if (!focused_keys || !focused_keys->listener)
-        return;
-    keys = focused_keys->listener;
-    if (!keys->key)
-        return;
-    serial = ++g.serial;
-    if (keys->modifiers)
-        keys->modifiers(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-                        serial, 4, 0, 0, 0);
-    keys->key(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-              serial, 0, 38, WL_KEYBOARD_KEY_STATE_PRESSED);
-    keys->key(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-              serial, 0, 38, WL_KEYBOARD_KEY_STATE_RELEASED);
-    if (keys->modifiers)
-        keys->modifiers(focused_keys->data, (struct wl_keyboard *)focused_keys->proxy,
-                        serial, 0, 0, 0, 0);
+    /* Control+L, evdev 38, selects the URL. */
+    inject_key(38, 4);
     log_msg("focus address bar");
 }
 
@@ -2936,7 +2941,7 @@ static void hide_keyboard(void)
      * left behind, which is harmless. */
     wl_proxy_destroy((struct wl_proxy *)text_input);
     text_input = NULL;
-    keyboard_up = 0;
+    keyboard_closed();
     log_msg("keyboard hidden");
 }
 
@@ -2955,8 +2960,9 @@ static void text_preedit_string(void *data, struct text_model *model, uint32_t s
     (void)data;
     (void)model;
     (void)serial;
-    (void)text;
-    (void)commit;
+    /* Not typed. The keyboard sends the text as commit_string when done. */
+    log_msg("preedit %zu chars (commit %zu)", text ? strlen(text) : 0,
+            commit ? strlen(commit) : 0);
 }
 
 static void text_delete_surrounding(void *data, struct text_model *model, uint32_t serial,
@@ -3036,9 +3042,23 @@ static void text_keysym(void *data, struct text_model *model, uint32_t serial, u
     case 0xff54: inject_key(KEY_DOWN, 0); break;
     case 0xff57: inject_key(KEY_END, 0); break;
     case 0xffff: inject_key(KEY_DELETE, 0); break;
-    default:
-        log_msg("keysym %#x not mapped", sym);
+    default: {
+        /* A printable character as a Latin-1 keysym (the character itself)
+         * or a Unicode keysym (0x1000000 plus the code point). Some webOS
+         * keyboards send typed characters this way instead of as
+         * commit_string. */
+        uint32_t ch = sym >= 0x1000000 ? sym - 0x1000000 : sym;
+        char text[2];
+
+        if (ch < 0x20 || ch > 0x7e) {
+            log_msg("keysym %#x not mapped", sym);
+            return;
+        }
+        text[0] = (char)ch;
+        text[1] = 0;
+        inject_text(text);
         return;
+    }
     }
     log_msg("keysym %#x", sym);
 }
@@ -3054,7 +3074,8 @@ static void text_leave(void *data, struct text_model *model)
 {
     (void)data;
     (void)model;
-    keyboard_up = 0;
+    log_msg("text model leave");
+    keyboard_closed();
 }
 
 /* Where the webOS keyboard sits on screen, in the remote's 1920x1080 grid;
@@ -3068,7 +3089,7 @@ static void text_panel_state(void *data, struct text_model *model, uint32_t stat
     log_msg("keyboard panel %u", state);
     /* Closed by its own button, not by us. */
     if (state == 0)
-        keyboard_up = 0;
+        keyboard_closed();
 }
 
 static void text_panel_rect(void *data, struct text_model *model, int32_t x, int32_t y,
@@ -3690,6 +3711,12 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
         log_msg("  swallowed: popup keyboard focus stays hidden from GTK");
         return;
     }
+    /* The focus is back after the webOS keyboard had it. GTK never knew. */
+    if (hook && hook->held_leave && surface == main_surface) {
+        hook->held_leave = 0;
+        log_msg("  swallowed: the held-back leave is cancelled");
+        return;
+    }
     if (orig && orig->enter)
         orig->enter(data, keyboard, serial, surface, keys);
 }
@@ -3710,10 +3737,146 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
         log_msg("  swallowed: toplevel keeps focus while a menu is open");
         return;
     }
+    /* The webOS keyboard is open and has taken the keyboard focus. Passed on,
+     * the leave makes GTK's field lose focus and disable text input, the
+     * adapter then drops the text model, and the keyboard still on screen
+     * types into nothing. Hold it back until the keyboard closes. */
+    if (hook && surface == main_surface && keyboard_up) {
+        hook->held_leave = 1;
+        hook->held_serial = serial;
+        log_msg("  held back: the webOS keyboard has the focus while it is open");
+        return;
+    }
     if (focused_keys == hook)
         focused_keys = NULL;
     if (orig && orig->leave)
         orig->leave(data, keyboard, serial, surface);
+}
+
+/* The webOS keyboard is closed. The leaves held back while it was open are
+ * passed on, unless the focus came back meanwhile. */
+static void keyboard_closed(void)
+{
+    int i;
+
+    keyboard_up = 0;
+    for (i = 0; i < MAX_HOOK; i++) {
+        struct hook *hook = &keyboard_hooks[i];
+        const struct wl_keyboard_listener *orig = hook->listener;
+
+        if (!hook->held_leave)
+            continue;
+        hook->held_leave = 0;
+        log_msg("keyboard leave passed on after the webOS keyboard closed");
+        if (focused_keys == hook)
+            focused_keys = NULL;
+        if (orig && orig->leave)
+            orig->leave(hook->data, (struct wl_keyboard *)hook->proxy, hook->held_serial,
+                        main_surface);
+    }
+}
+
+#define KEYMAP_CODE_MAX 0xfffu
+
+/* Blanks, with spaces so the size stays, each "<NAME> = code;" line of the
+ * xkb_keycodes section whose code is above 0xfff. xkbcommon 1.9 refuses the
+ * whole keymap over one such line ("Keycode too big"), and LG's keymap has
+ * them for remote-control keys. The compositor sends xkbcommon's own dump,
+ * one statement per line. Returns the number of lines blanked. */
+static size_t keymap_drop_big_keycodes(char *s)
+{
+    char *line = strstr(s, "xkb_keycodes");
+    size_t blanked = 0;
+
+    while (line && (line = strchr(line, '\n')) && *++line != '}') {
+        char *p = line + strspn(line, " \t"), *eq, *end;
+        size_t n = strcspn(p, "\n");
+
+        if (*p != '<' || !(eq = memchr(p, '=', n)))
+            continue;
+        if (strtoul(eq + 1, &end, 0) > KEYMAP_CODE_MAX && end > eq + 1) {
+            memset(p, ' ', n);
+            blanked++;
+        }
+    }
+    return blanked;
+}
+
+/* The xkb_symbols name of a keymap dump, "pc+us+inet(evdev)" for example,
+ * and whether it names the us layout. ascii_key and letter_code assume that
+ * layout, and a keymap GTK cannot compile leaves it with its own us one. */
+static const char *keymap_symbols(const char *text, int *len, int *us)
+{
+    const char *sym = strstr(text, "xkb_symbols \"");
+    const char *q, *end;
+
+    *len = 0;
+    *us = 0;
+    if (!sym)
+        return "";
+    sym += 13;
+    end = sym + strcspn(sym, "\"");
+    *len = (int)(end - sym);
+    for (q = sym; q + 2 <= end; q++)
+        if (q[0] == 'u' && q[1] == 's' && (q == sym || q[-1] == '+') &&
+            (q + 2 == end || q[2] == '+'))
+            *us = 1;
+    return sym;
+}
+
+/* A copy of the compositor's keymap without the keycodes xkbcommon refuses,
+ * as a new fd of the same size. Returns -1 to pass the original on.
+ * WEBOS_XDG_RAW_KEYMAP=1 always passes the original on. */
+static int keymap_fixed_copy(uint32_t format, int fd, uint32_t size)
+{
+    const char *raw = getenv("WEBOS_XDG_RAW_KEYMAP");
+    char *map, *text;
+    size_t blanked;
+    int out, n, us;
+    size_t done = 0;
+    struct stat st;
+    const char *sym;
+
+    if ((raw && raw[0] == '1') || format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 ||
+        size > (16u << 20))
+        return -1;
+    if (fstat(fd, &st) < 0 || st.st_size < (off_t)size)
+        return -1;
+    map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED)
+        return -1;
+    text = malloc(size + 1);
+    if (!text) {
+        munmap(map, size);
+        return -1;
+    }
+    memcpy(text, map, size);
+    munmap(map, size);
+    text[size] = 0;
+    blanked = keymap_drop_big_keycodes(text);
+    sym = keymap_symbols(text, &n, &us);
+    if (blanked && !us)
+        log_msg("keymap: symbols \"%.*s\" are not us, passed on as sent", n, sym);
+    if (!blanked || !us) {
+        free(text);
+        return -1;
+    }
+    out = ov_memfd(size);
+    while (out >= 0 && done < size) {
+        ssize_t w = write(out, text + done, size - done);
+
+        if (w <= 0) {
+            close(out);
+            out = -1;
+        } else {
+            done += (size_t)w;
+        }
+    }
+    if (out >= 0)
+        log_msg("keymap: %zu keycodes above 0xfff left out for xkbcommon, symbols \"%.*s\"",
+                blanked, n, sym);
+    free(text);
+    return out;
 }
 
 static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format,
@@ -3721,9 +3884,16 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 {
     struct hook *hook = hook_find(keyboard_hooks, keyboard);
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
+    int fixed = keymap_fixed_copy(format, fd, size);
 
+    if (fixed >= 0) {
+        close(fd);
+        fd = fixed;
+    }
     if (orig && orig->keymap)
         orig->keymap(data, keyboard, format, fd, size);
+    else
+        close(fd);
 }
 
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
@@ -3850,11 +4020,23 @@ void webos_xdg_prepare_listener(struct wl_proxy *proxy, void (***implementation)
             hook->proxy = proxy;
             hook->listener = *implementation;
             hook->data = *data;
+            hook->held_leave = 0;
+            if (!strcmp(name, "wl_keyboard")) {
+                const struct wl_keyboard_listener *kl = (const void *)*implementation;
+                char at[300];
+
+                where_is(kl && kl->key ? (const void *)kl->key : NULL, at, sizeof at);
+                if (strstr(at, "libgdk"))
+                    gdk_keys = hook;
+                log_msg("  wl_keyboard %u, key handler in %s", wl_proxy_get_id(proxy), at);
+            }
             if (!strcmp(name, "wl_keyboard") && !focused_keys)
                 focused_keys = hook;
             *implementation = (void (**)(void))(!strcmp(name, "wl_pointer")
                                                     ? (void *)&pointer_wrapper
                                                     : (void *)&keyboard_wrapper);
+        } else {
+            log_msg("  no free hook slot: this %s is not wrapped", name);
         }
     }
     if (v && v->kind != 0) {
