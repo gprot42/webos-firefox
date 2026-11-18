@@ -2973,6 +2973,14 @@ static void text_delete_surrounding(void *data, struct text_model *model, uint32
     (void)data;
     (void)model;
     (void)serial;
+    /* The keyboard's Clear All sends length UINT32_MAX for the whole field,
+     * as LG's Chromium reads it (InputMethodAuraLinuxNeva::OnDeleteRange). */
+    if (length == UINT32_MAX) {
+        log_msg("keyboard clear all");
+        inject_key(KEY_A, 4);
+        inject_key(KEY_BACKSPACE, 0);
+        return;
+    }
     if (index < 0)
         length = length ? length : (uint32_t)(-index);
     for (i = 0; i < length; i++)
