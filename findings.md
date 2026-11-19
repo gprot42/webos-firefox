@@ -738,7 +738,10 @@ is kernel 3.17.
   the TV's GIO plug-ins, built for its own GLib (2.48 on webOS 4).
 - `xkb/` from xkeyboard-config 2.38, added to the nc4 SDK
   (`XKB_CONFIG_ROOT`): xkbcommon 1.9 rejects LG's keymap ("Keycode too big",
-  keycodes above 0xfff) and builds a default keymap from this data instead.
+  keycodes above 0xfff) and GTK builds a default keymap from this data
+  instead. Since 0.1.30 the adapter leaves those keycodes out of the keymap
+  it passes on, so this data is only the fallback. Section 19 has the
+  details.
 - `gtk-immodules/` (`GTK_IM_MODULE_FILE`): GTK's Wayland input-method module
   (section on the on-screen keyboard).
 
@@ -1015,6 +1018,63 @@ without a new buffer now keeps the picture copied at attach time, as
 Wayland's own rules have it. Flat mode only; webOS 4's pop-ups unchanged.
 Not yet confirmed on the TV. The frozen page with full presents may or may
 not share this cause.
+
+**Nothing typed (0.1.30).** Two 6.5.3-47 TVs, a 43NANO756PA and a
+55NANO85SPA on firmware 03.53.45, ran 0.1.29. The keyboard opened on the
+address bar and no key reached Firefox. The reporter pointed at the keymap
+error in the protocol log. That error is real but not the cause on its own.
+Section 17 records the same rejection for the nc4 build, which types on
+webOS 25 because GTK keeps its default US keymap. Two causes fit the
+report, and neither is seen in a log yet.
+
+- The 6.5 log lists three wl_keyboard objects. Firefox binds one of its own
+  next to GDK's, and its key handler ignores keys. The adapter typed into
+  whichever wl_keyboard the compositor had entered last. If that was
+  Firefox's, every commit_string vanished without a log line.
+- The TV may hand the wl_keyboard focus to the keyboard panel. The adapter
+  passed that leave on, GTK's field lost focus, GTK disabled text input,
+  and the adapter deactivated and destroyed the text model. The 6.5 TV
+  keeps the panel up after deactivate, so the keyboard stayed on screen
+  while its commit_string went to a destroyed object. The 0.1.27 crash
+  "whenever a text field lost focus" was the same hide with the wrong
+  opcode, and a click elsewhere explains it as well as a leave does.
+
+- Injected keys go to GDK's wl_keyboard, recognised when its listener is
+  added by the library of its key handler, `libgdk`. The log lists each
+  wl_keyboard with that library.
+- While the webOS keyboard is open, a wl_keyboard leave of the main window
+  is held back from GTK. The keyboard closes on hide, on a text_model
+  leave, on panel state 0 and on loss of the seat. `keyboard_closed` then
+  passes the leave on, or drops it if the focus came back first.
+- Printable keysyms are typed. Latin-1 0x20 to 0x7e is the character itself
+  and 0x1000000 plus the code point is Unicode. Before, only editing keys
+  were typed and the rest logged "not mapped".
+- The keymap is passed on as a same-size copy with every `<NAME> = code;`
+  line of `xkb_keycodes` above 0xfff blanked. xkbcommon 1.9 then compiles
+  the rest and GTK and Firefox use LG's keymap. The copy is used only when
+  its `xkb_symbols` name the us layout, which `ascii_key` and `letter_code`
+  assume. Any other layout is passed on as sent and logged, which keeps
+  GTK's US fallback. `WEBOS_XDG_RAW_KEYMAP=1` always passes the original
+  on. Tested on the host against xkbcommon 1.8.0 with a us keymap plus
+  LG-style keycodes at 0x5030. As sent it is refused with the reporter's
+  error. Filtered it compiles with the same letters and modifier indices.
+  0xfff itself is accepted by xkbcommon and kept.
+- The log lines "held back", "keyboard leave passed on", "preedit N chars",
+  "text model leave", "key N dropped" and "keymap: ... symbols" tell the
+  cases apart.
+
+Still open.
+
+- Which of the two causes it was. The `type "..."` lines in a 0.1.29 log
+  would tell. Present means commit_string reached a live text model and the
+  target keyboard was at fault.
+- The hook table never forgets a wl_keyboard. If GDK destroys one while a
+  leave is held, or after it became `gdk_keys`, the adapter calls into a
+  freed listener. This needs a seat capability change and was never seen.
+- A keyboard that sends a character both as keysym and as commit_string
+  would type it twice.
+- Typed text appears in the adapter log as `type "..."`, and diagnose.sh
+  copies the log's last lines into the report.
 
 ## 20. webOS 26: Firefox's getenv wrapper crashes on a libc without __secure_getenv
 
